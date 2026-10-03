@@ -1,8 +1,9 @@
 # cmux-t3-sidebar
 
-[T3 Code](https://github.com/pingdotgg/t3code)'s thread sidebar for [cmux](https://cmux.com), with settle, snooze and a project filter.
+![Starting Claude in a thread, answering a permission prompt, settling and snoozing threads, and filtering by project](demo.gif)
 
-Unofficial: not affiliated with T3 Code or cmux. The design, status badges and palette come from T3 Code by T3 Tools Inc.; thanks to them for building it.
+> [!NOTE]
+> Unofficial: not affiliated with T3 Code. Heavily inspired by [T3 Code](https://github.com/pingdotgg/t3code)'s sidebar; thanks to the T3 team for building it.
 
 ## Setup
 
@@ -15,8 +16,6 @@ Requires cmux 0.64.25 or later.
    ```
 
 2. In cmux, right-click the sidebar toggle and pick **t3code**.
-3. Optional: merge `cmux.example.json` into `~/.config/cmux/cmux.json` for T3's background, conversation titles and Agent Hibernation.
+3. Recommended: merge `cmux.example.json` into `~/.config/cmux/cmux.json`. It turns on Agent Hibernation, which pauses idle agents and resumes them with `claude --resume` when you open their thread again. It also sets a matching background and names threads after their conversation.
 
 Settings such as auto-settle days and light or dark mode are at the top of `t3code.js`.
-
-Settled threads stay open as cmux workspaces. With Agent Hibernation on, cmux stops the longest-idle agents once more than 4 are running, and resumes each one with `claude --resume <id>` when you open it again.

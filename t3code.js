@@ -263,28 +263,24 @@ const homeMemo = memo(() => {
 // cmux reports both a real request AND Claude Code's "waiting for your input"
 // idle reminder (sent about a minute after a reply finishes) as needs_input.
 // A real request arrives while the agent is working; the reminder arrives after
-// it went idle - so the transition decides. When the sidebar first sees a
-// session already in needs_input (e.g. after a reload), cmux's own waiting cue
-// words in the latest message decide instead.
+// it went idle - so the transition decides. A session first seen already in
+// needs_input (the sidebar reloaded, cmux restarted) counts as the reminder:
+// it stays up until your next prompt, while real requests get answered, and
+// nothing else tells them apart (latestMessage is your prompt, not cmux's).
 const prevRaw = new Map(); // agent session id -> last raw status the engine saw
 const inputClass = new Map(); // session id -> { since, real }
-const WAITING_CUE = /\b(idle|wait|waiting|awaiting)\b/i;
-const REQUEST_CUE = /permission|approv|question|confirm|allow/i;
-function isRealInput(a, w) {
+function isRealInput(a) {
   const since = a.sinceEpoch ?? 0;
   const known = inputClass.get(a.id);
   if (known && known.since === since) return known.real;
   const prev = prevRaw.get(a.id);
   if (prev === "working") return true;
-  if (prev === "idle" || prev === "ended") return false;
-  const msg = String(w?.latestMessage ?? "");
-  if (REQUEST_CUE.test(msg)) return true;
-  if (WAITING_CUE.test(msg)) return false;
-  return true; // nothing to go on: trust cmux
+  if (prev === "needs_input" && known) return known.real; // same wait, re-stamped
+  return false;
 }
 function agentState(w) {
   const agents = w?.agents ?? [];
-  if (agents.some((a) => a.status === "needs_input" && isRealInput(a, w))) return "input";
+  if (agents.some((a) => a.status === "needs_input" && isRealInput(a))) return "input";
   if (agents.some((a) => a.status === "working")) return "working";
   return null;
 }
@@ -455,7 +451,7 @@ const [editingId, setEditingId] = signal(null);
 const [settledShown, setSettledShown] = signal(SETTLED_PAGE);
 const [snoozedExpanded, setSnoozedExpanded] = signal(false);
 const [settledLocalExpanded, setSettledLocalExpanded] = signal(false);
-const [notice, setNotice] = signal(null); // { text, at, undo? }
+const [notice, setNotice] = signal(null); // { text, at, undo?, anchor?, icon, settled? }
 const multi = new Set();
 let lastClicked = null;
 
@@ -469,8 +465,8 @@ const bulkIds = (id) => (multi.has(id) ? Array.from(multi) : [id]);
 // view (the sidebar scrolls and can't pin anything to the window's bottom).
 // anchor: { before: id | null } - where a settled/snoozed card used to be
 // (null = end of the list); { after: id } - under a card; none - list top.
-function showNotice(text, undo, anchor, icon) {
-  setNotice({ text, at: now(), undo, anchor, icon: icon ?? (undo ? "checkmark.circle" : "exclamationmark.circle") });
+function showNotice(text, undo, anchor, icon, extra) {
+  setNotice({ ...extra, text, at: now(), undo, anchor, icon: icon ?? (undo ? "checkmark.circle" : "exclamationmark.circle") });
 }
 
 // --- projects --------------------------------------------------------------------
@@ -511,15 +507,17 @@ const fresh = (list) => list.map((w) => byId(w.id) ?? w);
 const pinnedRows = memo(() => fresh(visible()).filter((w) => shelfOf(w).shelf === "active" && w.pinned), idsKey);
 const activeRows = memo(() => fresh(visible()).filter((w) => shelfOf(w).shelf === "active" && !w.pinned), idsKey);
 const cardRows = memo(() => fresh([...pinnedRows(), ...activeRows()]), idsKey);
+// Order inside a shelf: Snoozed wakes soonest first; Settled is newest first
+// (T3, falling back to the last prompt).
+function shelfSortKey(w) {
+  const s = shelfOf(w);
+  return s.shelf === "snoozed" ? s.until : s.shelf === "settled" ? -(s.at || lastPrompt(w)) : 0;
+}
+const byShelfKey = (a, b) => shelfSortKey(a) - shelfSortKey(b);
 const snoozedRows = memo(() =>
-  fresh(visible())
-    .filter((w) => shelfOf(w).shelf === "snoozed")
-    .sort((a, b) => shelfOf(a).until - shelfOf(b).until), idsKey);
+  fresh(visible()).filter((w) => shelfOf(w).shelf === "snoozed").sort(byShelfKey), idsKey);
 const settledRows = memo(() =>
-  fresh(visible())
-    .filter((w) => shelfOf(w).shelf === "settled")
-    // T3: newest settled first (falls back to the last prompt).
-    .sort((a, b) => (shelfOf(b).at || lastPrompt(b)) - (shelfOf(a).at || lastPrompt(a))), idsKey);
+  fresh(visible()).filter((w) => shelfOf(w).shelf === "settled").sort(byShelfKey), idsKey);
 
 // --- cmux mutations --------------------------------------------------------------
 function selectWorkspace(id) {
@@ -577,10 +575,19 @@ function settle(ids, auto) {
   }
   bump();
   if (!auto) {
-    showNotice("Settled " + ok.length + " thread" + (ok.length === 1 ? "" : "s"), () => {
-      restoreMarkers(ok, before);
-      for (const id of wasPinned) cmux("workspace.action", { action: "pin", workspace_id: id });
-    }, anchor);
+    // Settling again while the notice is up adds to it: one count, one Undo.
+    const prev = notice();
+    const last = prev?.settled && now() - prev.at < NOTICE_SECONDS ? prev.settled : null;
+    const batch = {
+      ids: [...(last?.ids ?? []), ...ok],
+      before: new Map([...(last?.before ?? []), ...before]),
+      pinned: [...(last?.pinned ?? []), ...wasPinned],
+    };
+    const n = batch.ids.length;
+    showNotice("Settled " + n + " thread" + (n === 1 ? "" : "s"), () => {
+      restoreMarkers(batch.ids, batch.before);
+      for (const id of batch.pinned) cmux("workspace.action", { action: "pin", workspace_id: id });
+    }, anchor, undefined, { settled: batch });
   }
 }
 // Back to the active list. manual = you did it (un-settle, pin): auto-settle
@@ -694,6 +701,35 @@ function migrateOldGroups(ws) {
   }
 }
 
+// --- cmux's own workspace order -------------------------------------------------
+// Cmd+1…9 pick workspaces by cmux's order, not the sidebar's, and settled or
+// snoozed threads stay wherever they were in it. So cmux's order is kept the
+// same as the sidebar's: open threads (in cmux's order), then Snoozed, then
+// Settled. cmux keeps pinned workspaces first, so they're sorted the same way
+// among themselves.
+const SHELF_RANK = { active: 0, snoozed: 1, settled: 2 };
+let orderSent = null; // the order last asked for, until cmux shows it
+function syncOrder(ws) {
+  if (shelfOverride.size) return; // cmux hasn't shown our own changes yet
+  const rows = ws.filter((w) => !isOldHeader(w)).map((w, i) => ({
+    id: w.id,
+    rank: (w.pinned ? 0 : 3) + SHELF_RANK[shelfOf(w).shelf],
+    key: shelfSortKey(w),
+    i,
+  }));
+  const have = rows.map((r) => r.id);
+  const want = rows.slice().sort((a, b) => a.rank - b.rank || a.key - b.key || a.i - b.i).map((r) => r.id);
+  const key = want.join(",");
+  if (key === have.join(",")) {
+    orderSent = null;
+    return;
+  }
+  // Ask once per order: if cmux won't take it, don't keep fighting it.
+  if (orderSent === key) return;
+  orderSent = key;
+  cmux("workspace.reorder_many", { workspace_ids: JSON.stringify(want) });
+}
+
 // --- background engine (wake timers, auto un-settle, auto-settle) -----------------
 const prevStatus = new Map();
 const upgraded = new Set();
@@ -726,7 +762,7 @@ computed(() => {
       if (a.status === "needs_input") {
         const since = a.sinceEpoch ?? 0;
         const known = inputClass.get(a.id);
-        if (!known || known.since !== since) inputClass.set(a.id, { since, real: isRealInput(a, w) });
+        if (!known || known.since !== since) inputClass.set(a.id, { since, real: isRealInput(a) });
       }
       prevRaw.set(a.id, a.status);
     }
@@ -772,6 +808,8 @@ computed(() => {
     });
     if (due.length) settle(due.map((w) => w.id), true);
   }
+
+  syncOrder(ws);
   return t;
 });
 

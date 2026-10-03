@@ -3,7 +3,7 @@
 ![Starting Claude in a thread, answering a permission prompt, settling and snoozing threads, and filtering by project](demo.gif)
 
 > [!NOTE]
-> Unofficial: not affiliated with T3 Code. Heavily inspired by [T3 Code](https://github.com/pingdotgg/t3code)'s sidebar; thanks to the T3 team for building it.
+> Not affiliated with T3 Code. Heavily inspired by [T3 Code](https://github.com/pingdotgg/t3code)'s sidebar; thanks to the T3 team for building it.
 
 ## Setup
 

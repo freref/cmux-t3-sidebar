@@ -1,0 +1,25 @@
+{
+  // Optional: merge into ~/.config/cmux/cmux.json, then run `cmux reload-config`.
+
+  // T3 Code's sidebar background.
+  "sidebarAppearance": {
+    "matchTerminalBackground": false,
+    "lightModeTintColor": "#FAFAFA",
+    "darkModeTintColor": "#0A0A0A",
+    "tintOpacity": 0.95
+  },
+
+  // Thread titles from the Claude/Codex conversation.
+  "automation": {
+    "workspaceAutoNaming": true
+  },
+
+  // Past 4 live agents, stop the longest-idle background ones (mostly settled
+  // threads) and resume their session when you open them again.
+  "terminal": {
+    "agentHibernation": {
+      "enabled": true,
+      "maxLiveTerminals": 4
+    }
+  }
+}

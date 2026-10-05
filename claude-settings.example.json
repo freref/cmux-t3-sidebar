@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "\"$HOME/.config/cmux/claude-turn-end.sh\" SessionStart", "timeout": 10 }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "\"$HOME/.config/cmux/claude-turn-end.sh\" UserPromptSubmit", "timeout": 10 }] }],
+    "PreToolUse": [{ "hooks": [{ "type": "command", "command": "\"$HOME/.config/cmux/claude-turn-end.sh\" PreToolUse", "timeout": 10 }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "\"$HOME/.config/cmux/claude-turn-end.sh\" Stop", "timeout": 10 }] }],
+    "StopFailure": [{ "hooks": [{ "type": "command", "command": "\"$HOME/.config/cmux/claude-turn-end.sh\" StopFailure", "timeout": 10 }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "\"$HOME/.config/cmux/claude-turn-end.sh\" SessionEnd", "timeout": 10 }] }],
+    "FileChanged": [{ "hooks": [{ "type": "command", "command": "\"$HOME/.config/cmux/claude-turn-end.sh\" FileChanged", "timeout": 10 }] }]
+  }
+}

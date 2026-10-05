@@ -1,71 +1,53 @@
-// cmux-t3-sidebar - a T3 Code-style thread sidebar for cmux.
-//
-// A port of T3 Code's left sidebar (apps/web/src/components/Sidebar.tsx) to a
-// cmux custom sidebar: search, project filter, new thread (incl. "No project"),
-// thread cards (project badge, status, branch, PR, Claude/Codex mark), hover
-// Snooze + Settle, Snoozed and Settled shelves, auto-settle, inline Undo.
-//
-// State: settled/snoozed state and times live in a marker line at the end of
-// each workspace's cmux description (cmux saves it across restarts):
-//   [t3 settled=<when> last=<last prompt>]
-//   [t3 snoozed=<until> at=<when> last=<last prompt>]
-//   [t3 manual=1 last=<last prompt>]   (you un-settled it: never auto-settle)
-//   [t3 last=<last prompt>]
-//
-// Setup: see README.md.
-
-// --- settings (T3 defaults) ------------------------------------------------------
-const AUTO_SETTLE_AFTER_DAYS = 3; // sidebarAutoSettleAfterDays; null = never
-const AUTO_SETTLE_ON_MERGE = true; // sidebarAutoSettleOnMerge (closed PRs always settle)
-const SETTLED_PAGE = 10; // shown before "Show N more"
-const SETTLED_STEP = 25; // revealed per "Show more" click
+const AUTO_SETTLE_AFTER_DAYS = 3; // null = never
+const AUTO_SETTLE_ON_MERGE = true; // closed PRs always settle
+const SLEEP_SETTLED = true; // settled threads exit Claude; opening one resumes it
+const SETTLED_PAGE = 10;
+const SETTLED_STEP = 25;
 const NOTICE_SECONDS = 5;
-const NOTICE_H = 36; // inline notice row
+const NOTICE_H = 36;
 
-// --- colors (Tailwind 500s, readable in light and dark) ---------------------------
 const INFO = "#3b82f6";
 const SUCCESS = "#10b981";
 const WARNING = "#f59e0b";
 const INPUT = "#6366f1";
-// T3 Code's sidebar palette (apps/web/src/index.css). The sidebar can't tell
-// light from dark mode, so pick one here.
+// The sidebar can't tell light from dark mode.
 const APPEARANCE = "light"; // "light" | "dark"
 const PALETTE = {
   light: {
-    rowActive: "#FFFFFF", // --sidebar-row-active: white
-    rowHover: "#FCFCFC", // --sidebar-row-hover: zinc-25
-    border: "#E4E4E7", // --sidebar-border: zinc-200
-    fg: "#27272A", // --foreground: zinc-800
-    muted: "#71717A", // --muted-foreground / --secondary-label: zinc-500
-    faint: "#71717A99", // muted at 60% (branch, pins, idle time)
-    control: "#71717A1F", // hover-control wash
+    rowActive: "#FFFFFF",
+    rowHover: "#FCFCFC",
+    border: "#E4E4E7",
+    fg: "#27272A",
+    muted: "#71717A",
+    faint: "#71717A99",
+    control: "#71717A1F",
   },
   dark: {
-    rowActive: "#FFFFFF0A", // white 4%
-    rowHover: "#FFFFFF0A", // white 4%
-    border: "#FFFFFF0F", // white 6%
-    fg: "#F5F5F5", // neutral-100
-    muted: "#8C8C8C", // neutral-500 lifted toward white
+    rowActive: "#FFFFFF0A",
+    rowHover: "#FFFFFF0A",
+    border: "#FFFFFF0F",
+    fg: "#F5F5F5",
+    muted: "#8C8C8C",
     faint: "#8C8C8C99",
     control: "#FFFFFF14",
   },
 }[APPEARANCE];
 const PR_COLORS = { open: "#10b981", closed: "#ef4444", merged: "#8b5cf6" };
+// Every pair is at least 0.1 apart in OKLab, so they stay distinct at badge
+// size. Near neighbours (amber/yellow, sky/blue, pink/rose) look the same.
 const PROJECT_COLORS = [
-  "#6b7280", "#ef4444", "#f97316", "#f59e0b", "#eab308", "#84cc16",
-  "#22c55e", "#10b981", "#14b8a6", "#06b6d4", "#0ea5e9", "#3b82f6",
-  "#6366f1", "#8b5cf6", "#a855f7", "#d946ef", "#ec4899", "#f43f5e",
-]; // gray red orange amber yellow lime green emerald teal cyan sky blue indigo violet purple fuchsia pink rose
+  "#ef4444", "#f97316", "#eab308", "#84cc16", "#10b981",
+  "#06b6d4", "#3b82f6", "#8b5cf6", "#d946ef", "#ec4899",
+];
 
 const SETTLED = "Settled";
-const CARD_H = 78; // T3 card height
-const SLIM_H = 36; // snoozed / settled rows
-const HEADER_H = 32; // shelf headers
+const CARD_H = 78;
+const SLIM_H = 36;
+const HEADER_H = 32;
 const ROW_GAP = 2;
 const SHELVES_TOP = 8;
 const SNOOZE_RE = /^Snoozed · .* · #(\d+)$/;
 
-// --- time ------------------------------------------------------------------------
 const sec = (t) => (t > 1e12 ? Math.floor(t / 1000) : Math.floor(t));
 function now() {
   const c = data.clock();
@@ -82,12 +64,10 @@ function dayTime(epoch) {
   const today = new Date(now() * 1000);
   return d.toDateString() === today.toDateString() ? clockTime(epoch) : DAYS[d.getDay()] + " " + clockTime(epoch);
 }
-// Performance: a binding re-runs whenever a signal it read changes, and the
-// clock changes every second. Relative labels only need the minute (T3 also
-// re-renders them once a minute), so they read this instead of now().
+// Relative labels only need the minute, so they read this instead of now()
+// and don't re-run every second.
 let minuteMemo = null; // defined with the other memos below
 const nowMinute = () => (minuteMemo ? minuteMemo() * 60 : now());
-// timestampFormat.ts: now / Nm / Nh / Nd (floored)
 function relative(t) {
   if (!t) return "";
   const d = nowMinute() - t;
@@ -96,7 +76,6 @@ function relative(t) {
   if (d < 86400) return Math.floor(d / 3600) + "h";
   return Math.floor(d / 86400) + "d";
 }
-// Sidebar.logic.ts: working duration Ns / Nm / Hh Mm
 function duration(s) {
   s = Math.max(0, Math.floor(s));
   if (s < 60) return s + "s";
@@ -104,14 +83,12 @@ function duration(s) {
   if (m < 60) return m + "m";
   return Math.floor(m / 60) + "h " + (m % 60) + "m";
 }
-// threadSettled.ts: wake countdown, ceiling, Nm (min 1) / Nh / Nd
 function countdown(until) {
   const d = until - nowMinute();
   if (d < 3600) return Math.max(1, Math.ceil(d / 60)) + "m";
   if (d < 86400) return Math.ceil(d / 3600) + "h";
   return Math.ceil(d / 86400) + "d";
 }
-// threadSettled.ts snooze presets
 function snoozePresets(t) {
   const base = new Date(t * 1000);
   const at = (days, hour) => {
@@ -155,14 +132,11 @@ function parseCustomSnooze(text, t) {
   return null;
 }
 
-// --- project identity (projectIdentity.ts) ---------------------------------------
-// A project is a full directory path. Its label is the folder name, extended
-// with parent folders only when another project shares that name
-// (".../PI/learn-cpp" vs ".../old/learn-cpp" -> "PI/learn-cpp", "old/learn-cpp").
+// A project's label is its folder name, plus parent folders only when another
+// project shares that name.
 const pathSegments = (dir) => String(dir ?? "").split("/").filter(Boolean);
 const baseName = (dir) => pathSegments(dir).pop() ?? "";
-// Your home folder isn't a project: threads there are "No project" (T3's
-// "start without a project"), and New thread can always start one there.
+// The home folder isn't a project: threads there are "No project".
 const NO_PROJECT = "No project";
 function isHome(dir) {
   const home = homeDir();
@@ -186,21 +160,19 @@ function monogram(name) {
     first;
   return Array.from((first + second).toUpperCase()).slice(0, 2).join("");
 }
-function projectColor(name) {
-  const seed = String(name ?? "").normalize("NFKC").trim().toLocaleLowerCase("en-US") || "project";
-  let index = 0;
-  for (const glyph of seed) index = (index * 31 + (glyph.codePointAt(0) ?? 0)) % PROJECT_COLORS.length;
-  return PROJECT_COLORS[index];
+function projectColor(dir) {
+  let h = 0x811c9dc5;
+  for (const ch of String(dir ?? "")) h = Math.imul(h ^ ch.codePointAt(0), 0x01000193);
+  return PROJECT_COLORS[(h >>> 0) % PROJECT_COLORS.length];
 }
 
-// --- data access -----------------------------------------------------------------
 const all = () => data.workspaces() ?? [];
 const groups = () => data.groups() ?? [];
 
-// Performance: cmux re-sends the whole workspace list whenever any workspace
-// changes. Each workspace gets its own signal that only fires when *its* data
-// changed, so a card's bindings (which read byId) re-run only for that card.
-const wsSignals = new Map(); // id -> { read, write, json }
+// cmux re-sends the whole workspace list on any change. Each workspace gets
+// its own signal that only fires when its data changed, so only that card's
+// bindings re-run.
+const wsSignals = new Map();
 function wsEntry(id) {
   let e = wsSignals.get(id);
   if (!e) {
@@ -231,8 +203,6 @@ computed(() => {
 });
 const byId = (id) => (id ? wsEntry(id).read() : undefined);
 
-// A derived value that only notifies when it really changed (by `key`, default
-// the value itself): downstream bindings don't re-run for equal results.
 function memo(fn, key) {
   const [read, write] = signal(undefined);
   let last = {};
@@ -249,7 +219,6 @@ function memo(fn, key) {
 }
 const idsKey = (list) => list.map((w) => w.id).join(",");
 minuteMemo = memo(() => Math.floor(now() / 60));
-// Home folder (for "No project"), memoized so labels don't track the whole list.
 const homeMemo = memo(() => {
   for (const w of all()) {
     const m = /^\/Users\/[^/]+/.exec(w.directory ?? "");
@@ -257,18 +226,14 @@ const homeMemo = memo(() => {
   }
   return null;
 });
-// --- Input vs Done ------------------------------------------------------------------
-// Input = the agent is blocked on you mid-run (permission prompt, plan approval,
-// a question). Done = the run finished and you haven't looked yet (unread).
-// cmux reports both a real request AND Claude Code's "waiting for your input"
-// idle reminder (sent about a minute after a reply finishes) as needs_input.
-// A real request arrives while the agent is working; the reminder arrives after
-// it went idle - so the transition decides. A session first seen already in
-// needs_input (the sidebar reloaded, cmux restarted) counts as the reminder:
-// it stays up until your next prompt, while real requests get answered, and
-// nothing else tells them apart (latestMessage is your prompt, not cmux's).
-const prevRaw = new Map(); // agent session id -> last raw status the engine saw
-const inputClass = new Map(); // session id -> { since, real }
+// cmux reports both a real request and Claude Code's "waiting for your input"
+// idle reminder (about a minute after a reply) as needs_input. A real request
+// arrives while the agent is working, the reminder after it went idle, so the
+// transition decides. A session first seen already in needs_input (sidebar
+// reloaded, cmux restarted) counts as the reminder. Nothing else tells them
+// apart (latestMessage is your prompt, not cmux's).
+const prevRaw = new Map();
+const inputClass = new Map();
 function isRealInput(a) {
   const since = a.sinceEpoch ?? 0;
   const known = inputClass.get(a.id);
@@ -278,26 +243,53 @@ function isRealInput(a) {
   if (prev === "needs_input" && known) return known.real; // same wait, re-stamped
   return false;
 }
+// Claude Code puts its state in the terminal title: ◐/◑ while a turn runs, ✳
+// otherwise. cmux only learns that a turn ended from the Stop hook, which Claude
+// Code skips when you interrupt it (Esc), so cmux reports "working" until your
+// next prompt. While the agent's tab shows Claude's own title, its ✳ wins. A tab
+// cmux renamed (auto-naming, a manual rename) hides it and keeps cmux's status.
+const CLAUDE_IDLE_TITLE = /^✳(\s|$)/;
+function isWorking(w, a) {
+  if (a.status !== "working") return false;
+  if (!String(a.kind ?? "").toLowerCase().includes("claude")) return true;
+  const tab = a.panelId && (w?.tabs ?? []).find((t) => t.id === a.panelId);
+  return !(tab && CLAUDE_IDLE_TITLE.test(tab.title ?? ""));
+}
 function agentState(w) {
   const agents = w?.agents ?? [];
   if (agents.some((a) => a.status === "needs_input" && isRealInput(a))) return "input";
-  if (agents.some((a) => a.status === "working")) return "working";
+  if (agents.some((a) => isWorking(w, a))) return "working";
   return null;
 }
-function workingSince(w) {
-  const a = (w?.agents ?? []).find((x) => x.status === "working");
-  return a ? sec(a.sinceEpoch ?? a.lastActivityAt ?? now()) : now();
+// cmux restarts sinceEpoch on every prompt, including one you send to steer a
+// running turn, so "Working" counts from the start of the unbroken run instead.
+// A gap of a few seconds still counts as the same run: a message queued while
+// Claude works can start its own turn right after the Stop.
+const STEER_GAP = 3;
+const runStart = new Map(); // agent id -> { start, seen }
+function trackRun(w, a, t) {
+  if (!isWorking(w, a)) return;
+  const known = runStart.get(a.id);
+  const start = known && t - known.seen <= STEER_GAP ? known.start : sec(a.sinceEpoch ?? a.lastActivityAt ?? t);
+  runStart.set(a.id, { start, seen: t });
 }
-// Title like T3: the conversation, not the terminal. Claude Code / Codex put a
-// spinner glyph and a generic name ("✳ Claude Code") in the terminal title;
-// a real title there (a topic Claude Code set, or your own rename) still wins.
+function workingSince(w) {
+  const a = (w?.agents ?? []).find((x) => isWorking(w, x));
+  if (!a) return now();
+  return runStart.get(a.id)?.start ?? sec(a.sinceEpoch ?? a.lastActivityAt ?? now());
+}
+// Claude Code / Codex put a spinner glyph and a generic name ("✳ Claude Code")
+// in the terminal title; a real title there (a topic Claude Code set, or your
+// own rename) still wins.
 const TITLE_GLYPHS = /^[\s\u2722-\u273D\u00B7*\u2800-\u28FF\u2022\u25CF\u25D0-\u25D3\u23FA]+/u;
 const GENERIC_TITLE = /^(claude( code)?|codex|openai codex|zsh|bash|fish|sh|login|~|~?\/.*)$/i;
 const SHELL_TITLE = /^\S+@\S+:/;
 // Sessions still running (cmux keeps ended ones around after you quit the agent).
 const liveAgents = (w) => (w?.agents ?? []).filter((a) => a.status !== "ended");
 function agentKind(w) {
-  const k = String(liveAgents(w)[0]?.kind ?? "").toLowerCase();
+  // A sleeping thread keeps its mark: opening it starts Claude again.
+  const a = liveAgents(w)[0] ?? (markerFields(w).slept ? claudeAgent(w) : undefined);
+  const k = String(a?.kind ?? "").toLowerCase();
   return k.includes("claude") ? "claude" : k.includes("codex") ? "codex" : k ? "other" : null;
 }
 function threadTitle(w) {
@@ -314,14 +306,13 @@ function prOf(w) {
   return w?.pr ?? null;
 }
 
-// --- optimistic state ------------------------------------------------------------
-// Every action flips local state the same frame; overrides clear themselves
-// once cmux's data (refreshed about once a second) agrees, or after 10s.
+// Actions flip local state at once; overrides clear themselves once cmux's
+// data (refreshed about once a second) agrees, or after 10s.
 const [tick, setTick] = signal(0);
 const bump = () => setTick(tick() + 1);
-const shelfOverride = new Map(); // id -> { shelf, until?, at }
-const woke = new Map(); // id -> wokeAt (Woke pill)
-const snoozedWhileWorking = new Set(); // a run already going when snoozed may wake it on finishing
+const shelfOverride = new Map();
+const woke = new Map();
+const snoozedWhileWorking = new Set();
 const wakeAnchor = new Map(); // id -> id of the active row that followed it when snoozed
 let selectOverride = null;
 
@@ -338,7 +329,7 @@ const MARKER_RE = /\s*\[t3(?::(settled|snoozed:(\d+))|((?:\s+[a-z]+=\d+)*))\]\s*
 // cmux applies a description change a moment later; until its data shows what
 // we wrote, read our own pending write - so a second write in between (e.g. the
 // prompt-time save right after a settle) builds on it instead of undoing it.
-const pendingDesc = new Map(); // workspace id -> { desc, at }
+const pendingDesc = new Map();
 function descriptionOf(w) {
   const p = w && pendingDesc.get(w.id);
   if (p) {
@@ -365,25 +356,56 @@ function markerOf(w) {
   if (f.settled !== undefined) return { shelf: "settled", at: f.settled || null, last, legacy: !!f.legacy };
   return { shelf: "active", manual: !!f.manual, last };
 }
-// fields: e.g. { settled: t, last: t } - zero/empty fields are dropped; {} or
-// null removes the marker (and the description, if nothing else was in it).
+// Zero/empty fields are dropped; {} or null removes the marker (and the
+// description, if nothing else was in it).
 function writeMarker(id, fields) {
   const w = byId(id);
   const current = descriptionOf(w);
+  // A sleeping thread stays asleep whatever else changes, until it's woken.
+  const { slept, pid } = markerFields(w);
+  if (slept && !(fields && "slept" in fields)) fields = { ...fields, slept, pid };
   const base = current.replace(MARKER_RE, "");
   const parts = Object.entries(fields ?? {})
     .filter(([k, v]) => k !== "legacy" && v)
     .map(([k, v]) => k + "=" + Math.floor(v));
   const next = parts.length ? (base ? base + "\n" : "") + "[t3 " + parts.join(" ") + "]" : base;
+  // No bump() here: shelf changes re-render themselves, and bumping on every
+  // prompt-time save re-checked every card.
+  setDescription(id, current, next);
+}
+function setDescription(id, current, next) {
   if (next === current) return;
-  // (No bump() here: shelf changes - settle/snooze/wake - re-render themselves,
-  // and a prompt-time save changes nothing on screen. Bumping on every save
-  // re-checked every card on each prompt.)
   pendingDesc.set(id, { desc: next, at: now() });
   if (next) cmux("workspace.action", { action: "set_description", workspace_id: id, description: next });
   else cmux("workspace.action", { action: "clear_description", workspace_id: id });
 }
-// Last prompt you sent there: cmux's value this session, else the saved one.
+
+// Favorite projects are "[t3:fav <dir>]" lines just above the marker. The
+// sidebar has nowhere else to keep them, so every workspace carries the whole
+// list: a favorite outlives its own project's threads.
+const FAV_RE = /^\[t3:fav (.+)\]$/;
+function favLines(w) {
+  return descriptionOf(w).split("\n").map((l) => FAV_RE.exec(l)?.[1]).filter(Boolean).sort();
+}
+function writeFavorites(w, dirs) {
+  const current = descriptionOf(w);
+  const m = MARKER_RE.exec(current);
+  const base = (m ? current.slice(0, m.index) : current).split("\n").filter((l) => !FAV_RE.test(l)).join("\n");
+  const next = [base, ...dirs.map((d) => "[t3:fav " + d + "]"), m ? m[0].trim() : ""].filter(Boolean).join("\n");
+  setDescription(w.id, current, next);
+}
+const favorites = memo(() => {
+  tick();
+  const dirs = new Set();
+  for (const w of all()) if (!isOldHeader(w)) for (const d of favLines(w)) dirs.add(d);
+  return Array.from(dirs).sort();
+}, (dirs) => dirs.join("\n"));
+const isFavorite = (dir) => favorites().includes(dir);
+function toggleFavorite(dir) {
+  const next = isFavorite(dir) ? favorites().filter((d) => d !== dir) : [...favorites(), dir].sort();
+  for (const w of all()) if (!isOldHeader(w)) writeFavorites(w, next);
+  bump();
+}
 function lastPrompt(w) {
   return Math.max(w?.latestAt ? sec(w.latestAt) : 0, markerFields(w).last ?? 0);
 }
@@ -413,9 +435,8 @@ function isSelected(w) {
 }
 const isWoke = (id) => (tick(), woke.has(id));
 
-// --- top status (Sidebar.tsx resolveTopStatus) -------------------------------------
-// No clock read here, so icon/color/dimming bindings don't re-run every second;
-// statusText() adds the ticking "Working 12s" for the one label that needs it.
+// No clock read here, so icon/color/dimming bindings don't re-run every
+// second; statusText() adds the ticking "Working 12s".
 function topStatus(w) {
   const s = agentState(w);
   if (s === "input") return { kind: "input", icon: "questionmark.bubble", color: INPUT, text: "Input" };
@@ -429,7 +450,6 @@ function statusText(w) {
   if (!s) return relative(lastPrompt(w));
   return s.kind === "working" ? "Working " + duration(now() - workingSince(w)) : s.text;
 }
-// Sidebar.logic.ts recede rule
 function receded(w) {
   if (!w || isSelected(w) || isMulti(w.id)) return false;
   const s = topStatus(w)?.kind;
@@ -440,10 +460,9 @@ function receded(w) {
 }
 const canSnooze = (w) => !!w && agentState(w) !== "input";
 
-// --- view state ------------------------------------------------------------------
 const [query, setQuery] = signal("");
-const [scope, setScopeRaw] = signal(null); // project directory, or null = all projects
-const [picker, setPicker] = signal(null); // null | "scope" | "new"
+const [scope, setScopeRaw] = signal(null);
+const [picker, setPicker] = signal(null);
 const [pickerQuery, setPickerQuery] = signal("");
 const [snoozeMenuFor, setSnoozeMenuFor] = signal(null);
 const [customFor, setCustomFor] = signal(null);
@@ -451,25 +470,24 @@ const [editingId, setEditingId] = signal(null);
 const [settledShown, setSettledShown] = signal(SETTLED_PAGE);
 const [snoozedExpanded, setSnoozedExpanded] = signal(false);
 const [settledLocalExpanded, setSettledLocalExpanded] = signal(false);
-const [notice, setNotice] = signal(null); // { text, at, undo?, anchor?, icon, settled? }
+const [notice, setNotice] = signal(null);
 const multi = new Set();
 let lastClicked = null;
 
 function setScope(dir) {
   setScopeRaw(dir);
-  setSettledShown(SETTLED_PAGE); // paging resets when the scope changes
+  setSettledShown(SETTLED_PAGE);
 }
 const isMulti = (id) => (tick(), multi.has(id));
 const bulkIds = (id) => (multi.has(id) ? Array.from(multi) : [id]);
-// Notices show inline in the thread list where you acted, so they're always in
-// view (the sidebar scrolls and can't pin anything to the window's bottom).
-// anchor: { before: id | null } - where a settled/snoozed card used to be
-// (null = end of the list); { after: id } - under a card; none - list top.
+// Notices show inline where you acted (the sidebar can't pin anything to the
+// window's bottom). anchor: { before: id | null } - where a settled/snoozed
+// card used to be (null = end of the list); { after: id } - under a card;
+// none - list top.
 function showNotice(text, undo, anchor, icon, extra) {
   setNotice({ ...extra, text, at: now(), undo, anchor, icon: icon ?? (undo ? "checkmark.circle" : "exclamationmark.circle") });
 }
 
-// --- projects --------------------------------------------------------------------
 const projectIndex = memo(() => {
   const dirs = Array.from(new Set(all().map((w) => w.directory).filter((d) => d && !isHome(d)))).sort((a, b) => a.localeCompare(b));
   const segs = new Map(dirs.map((d) => [d, pathSegments(d)]));
@@ -482,13 +500,26 @@ const projectIndex = memo(() => {
   }
   return { dirs, labels };
 }, (v) => v.dirs.join("\n"));
-// Projects, sorted by full path.
 function projects() {
   return projectIndex().dirs.map((dir) => ({ dir, name: projectLabel(dir) }));
 }
+// `keep` stays listed anyway (the filter's current project, so its checkmark
+// doesn't vanish).
+function activeProjects(keep) {
+  const dirs = new Set(all().filter((w) => !isOldHeader(w) && shelfOf(w).shelf === "active").map((w) => w.directory));
+  return projects().filter((p) => dirs.has(p.dir) || p.dir === keep);
+}
+// The new-thread menu also lists favorites, even ones with no thread left, and
+// puts them first.
+function newThreadProjects() {
+  const out = activeProjects();
+  for (const dir of favorites()) {
+    if (!isHome(dir) && !out.some((p) => p.dir === dir)) out.push({ dir, name: projectLabel(dir) });
+  }
+  return out.sort((a, b) => isFavorite(b.dir) - isFavorite(a.dir) || a.dir.localeCompare(b.dir));
+}
 const scopeName = () => (scope() ? projectLabel(scope()) : "");
 
-// --- lists -----------------------------------------------------------------------
 function matchesSearch(w) {
   const q = query().trim().toLowerCase();
   if (!q) return true;
@@ -497,8 +528,6 @@ function matchesSearch(w) {
   const prs = w.prs ?? (w.pr ? [w.pr] : []);
   return /^\d+$/.test(n) && prs.some((p) => String(p.number).startsWith(n));
 }
-// Lists only notify when membership or order changes (consumers use ids; card
-// content comes from the per-workspace signals).
 const visible = memo(() => {
   tick();
   return all().filter((w) => !isOldHeader(w) && (!scope() || w.directory === scope()) && matchesSearch(w));
@@ -507,8 +536,6 @@ const fresh = (list) => list.map((w) => byId(w.id) ?? w);
 const pinnedRows = memo(() => fresh(visible()).filter((w) => shelfOf(w).shelf === "active" && w.pinned), idsKey);
 const activeRows = memo(() => fresh(visible()).filter((w) => shelfOf(w).shelf === "active" && !w.pinned), idsKey);
 const cardRows = memo(() => fresh([...pinnedRows(), ...activeRows()]), idsKey);
-// Order inside a shelf: Snoozed wakes soonest first; Settled is newest first
-// (T3, falling back to the last prompt).
 function shelfSortKey(w) {
   const s = shelfOf(w);
   return s.shelf === "snoozed" ? s.until : s.shelf === "settled" ? -(s.at || lastPrompt(w)) : 0;
@@ -519,7 +546,6 @@ const snoozedRows = memo(() =>
 const settledRows = memo(() =>
   fresh(visible()).filter((w) => shelfOf(w).shelf === "settled").sort(byShelfKey), idsKey);
 
-// --- cmux mutations --------------------------------------------------------------
 function selectWorkspace(id) {
   if (!id) return;
   selectOverride = id;
@@ -531,7 +557,6 @@ function newThread(dir) {
   if (dir) params.working_directory = dir;
   cmux("workspace.create", params);
 }
-// Where the first of these cards sits now, as "before the next remaining card".
 function anchorForRemoval(ids) {
   const cards = cardRows().map((w) => w.id);
   const first = cards.findIndex((id) => ids.includes(id));
@@ -539,9 +564,9 @@ function anchorForRemoval(ids) {
   const next = cards.slice(first + 1).find((id) => !ids.includes(id));
   return { before: next ?? null };
 }
-// Settling/snoozing the open thread moves to the next card (wrapping), or, when
-// none is left, opens a fresh "No project" thread (home folder) - not a copy of
-// the thread that was just settled/snoozed.
+// Settling/snoozing the open thread moves to the next card (wrapping), or,
+// when none is left, opens a fresh "No project" thread, not a copy of the one
+// just settled.
 function moveSelectionAway(ids) {
   const selected = all().find((w) => isSelected(w));
   if (!selected || !ids.includes(selected.id)) return;
@@ -571,11 +596,11 @@ function settle(ids, auto) {
   for (const id of ok) {
     shelfOverride.set(id, { shelf: "settled", at: now() });
     woke.delete(id);
+    lastOpen.delete(id); // you're done with it: no grace before it sleeps
     writeMarker(id, { settled: now(), last: lastPrompt(byId(id)) });
   }
   bump();
   if (!auto) {
-    // Settling again while the notice is up adds to it: one count, one Undo.
     const prev = notice();
     const last = prev?.settled && now() - prev.at < NOTICE_SECONDS ? prev.settled : null;
     const batch = {
@@ -590,8 +615,8 @@ function settle(ids, auto) {
     }, anchor, undefined, { settled: batch });
   }
 }
-// Back to the active list. manual = you did it (un-settle, pin): auto-settle
-// then leaves the thread alone for good, like T3's manual override.
+// manual = you did it (un-settle, pin): auto-settle then leaves the thread
+// alone for good.
 function toActive(ids, manual) {
   for (const id of ids) {
     shelfOverride.set(id, { shelf: "active", at: now() });
@@ -599,7 +624,6 @@ function toActive(ids, manual) {
   }
   bump();
 }
-// Undo: put the markers back exactly as they were.
 function restoreMarkers(ids, before) {
   for (const id of ids) {
     const f = before.get(id) ?? {};
@@ -611,7 +635,6 @@ function restoreMarkers(ids, before) {
 }
 function unsettle(ids, manual = true) {
   toActive(ids, manual);
-  // Un-settling jumps to the top of the active list.
   for (const id of [...ids].reverse()) cmux("workspace.action", { action: "move_top", workspace_id: id });
 }
 function snooze(ids, until) {
@@ -642,7 +665,6 @@ function wake(ids, automatic) {
   for (const id of ids) {
     snoozedWhileWorking.delete(id);
     if (automatic) woke.set(id, now());
-    // Return to the original position: before the row that followed it.
     const anchor = wakeAnchor.get(id);
     wakeAnchor.delete(id);
     const order = all().map((w) => w.id);
@@ -658,12 +680,74 @@ function dismissWoke(id) {
   bump();
 }
 
-// --- one-time migration from the old group-based storage ------------------------
-// Earlier versions kept shelves in cmux groups named "Settled" and
-// "Snoozed · … · #<epoch>". Creating such a group made cmux spawn a header
-// workspace with the group's name. Members get a description marker instead,
-// the groups are dissolved, and those spawned header workspaces (exact group
-// name as title, no agent session) are closed.
+// Settled threads don't keep Claude running. Once the Undo notice is gone (or,
+// for a settled thread you reopened, 10 minutes after you left it), its idle
+// Claude is exited (Ctrl+C clears an unsent draft, then /exit). Opening the
+// thread starts the same session again with the resume command
+// claude-turn-end.sh saved for it (same flags and permission mode). The marker
+// remembers it: slept=<when> pid=<the Claude process that was exited>.
+const SLEEP_GRACE = 600; // seconds since you last had the thread open
+const RESUME_SCRIPT = "~/.config/cmux/claude-turn-end.sh";
+const sleepSteps = new Map(); // id -> when Ctrl+C was sent
+const lastOpen = new Map(); // id -> when it was last the selected thread
+const resumeTyped = new Set();
+const claudeAgent = (w) => (w?.agents ?? []).find((a) => String(a.kind ?? "").toLowerCase().includes("claude"));
+// The thread's running Claude. cmux doesn't always notice Claude exiting (a
+// session still at the folder-trust prompt never reports it), so the process a
+// thread was put to sleep from doesn't count, even if cmux still lists it.
+function runningClaude(w) {
+  const a = claudeAgent(w);
+  if (!a || a.status === "ended") return null;
+  const f = markerFields(w);
+  return f.slept && (!f.pid || f.pid === a.pid) ? null : a;
+}
+// surface.send_text / send_key take the panel id (a tab's `id`, an agent's
+// `panelId`), not the `surfaceId` the sidebar data also carries.
+function typeInto(w, panelId, text, enter) {
+  cmux("surface.send_text", { workspace_id: w.id, surface_id: panelId, text });
+  if (enter) cmux("surface.send_key", { workspace_id: w.id, surface_id: panelId, key: "enter" });
+}
+function sleepSettled(w, t) {
+  const a = runningClaude(w);
+  const ready =
+    a && a.panelId && agentState(w) === null &&
+    !(a.children ?? []).some((c) => c.running) &&
+    !shelfOverride.has(w.id) && t - (shelfOf(w).at ?? 0) >= NOTICE_SECONDS + 5 &&
+    t - (lastOpen.get(w.id) ?? 0) >= SLEEP_GRACE;
+  const ctrlC = sleepSteps.get(w.id);
+  if (!ready) {
+    sleepSteps.delete(w.id);
+  } else if (!ctrlC) {
+    typeInto(w, a.panelId, "\u0003");
+    sleepSteps.set(w.id, t);
+  } else if (t - ctrlC >= 1) {
+    typeInto(w, a.panelId, "/exit", true);
+    resumeTyped.delete(w.id);
+    writeMarker(w.id, { ...markerFields(w), slept: t, pid: a.pid ?? 0 });
+    sleepSteps.delete(w.id);
+  }
+}
+function wakeSlept(w) {
+  const f = markerFields(w);
+  if (!f.slept) return;
+  // Running again already (you started it, or cmux restored it).
+  if (runningClaude(w)) return writeMarker(w.id, { ...f, slept: 0, pid: 0 });
+  if (resumeTyped.has(w.id)) return;
+  const a = claudeAgent(w);
+  const panelId = a?.panelId ?? (w.tabs ?? []).find((x) => x.directory)?.id;
+  if (!panelId) return;
+  const id = /^[\w-]+$/.test(a?.id ?? "") ? a.id : "";
+  const fallback = id ? "claude --resume " + id : "claude --continue";
+  typeInto(w, panelId, `if [ -x ${RESUME_SCRIPT} ]; then ${RESUME_SCRIPT} resume ${id}; else ${fallback}; fi`, true);
+  resumeTyped.add(w.id);
+  writeMarker(w.id, { ...f, slept: 0, pid: 0 });
+}
+
+// One-time migration: earlier versions kept shelves in cmux groups named
+// "Settled" and "Snoozed · … · #<epoch>", and cmux spawned a header workspace
+// per group. Members get a description marker instead, the groups are
+// dissolved, and those header workspaces (group name as title, no agent
+// session) are closed.
 const migratedGroups = new Set();
 const closedHeaders = new Set();
 function isOldHeader(w) {
@@ -680,7 +764,6 @@ function migrateOldGroups(ws) {
       // un-settled, a prompt time): never overwrite it from the old group.
       if (MARKER_RE.test(descriptionOf(w))) continue;
       if (snoozed) {
-        // Only a snooze that hasn't run out yet carries over.
         const until = +snoozed[1];
         if (until > now()) writeMarker(w.id, { snoozed: until, at: now() });
       } else {
@@ -701,14 +784,12 @@ function migrateOldGroups(ws) {
   }
 }
 
-// --- cmux's own workspace order -------------------------------------------------
-// Cmd+1…9 pick workspaces by cmux's order, not the sidebar's, and settled or
-// snoozed threads stay wherever they were in it. So cmux's order is kept the
-// same as the sidebar's: open threads (in cmux's order), then Snoozed, then
-// Settled. cmux keeps pinned workspaces first, so they're sorted the same way
-// among themselves.
+// Cmd+1…9 follow cmux's workspace order, not the sidebar's, so cmux's order
+// is kept the same as the sidebar's: open threads (in cmux's order), then
+// Snoozed, then Settled. cmux keeps pinned workspaces first, so they're sorted
+// the same way among themselves.
 const SHELF_RANK = { active: 0, snoozed: 1, settled: 2 };
-let orderSent = null; // the order last asked for, until cmux shows it
+let orderSent = null;
 function syncOrder(ws) {
   if (shelfOverride.size) return; // cmux hasn't shown our own changes yet
   const rows = ws.filter((w) => !isOldHeader(w)).map((w, i) => ({
@@ -730,7 +811,6 @@ function syncOrder(ws) {
   cmux("workspace.reorder_many", { workspace_ids: JSON.stringify(want) });
 }
 
-// --- background engine (wake timers, auto un-settle, auto-settle) -----------------
 const prevStatus = new Map();
 const upgraded = new Set();
 let lastSweep = 0;
@@ -741,7 +821,6 @@ computed(() => {
 
   migrateOldGroups(ws);
 
-  // Optimistic overrides / pending descriptions cmux never confirmed expire after 10s.
   let expired = false;
   for (const [id, p] of pendingDesc) {
     if (t - p.at > 10) {
@@ -757,13 +836,17 @@ computed(() => {
   }
   if (expired) bump();
 
+  const favs = favorites();
+  const favKey = favs.join("\n");
   for (const w of ws) {
+    if (!isOldHeader(w) && favLines(w).join("\n") !== favKey) writeFavorites(w, favs);
     for (const a of w.agents ?? []) {
       if (a.status === "needs_input") {
         const since = a.sinceEpoch ?? 0;
         const known = inputClass.get(a.id);
         if (!known || known.since !== since) inputClass.set(a.id, { since, real: isRealInput(a) });
       }
+      trackRun(w, a, t);
       prevRaw.set(a.id, a.status);
     }
     const s = agentState(w);
@@ -771,7 +854,7 @@ computed(() => {
     prevStatus.set(w.id, s);
     const shelf = shelfOf(w);
     const marker = markerOf(w);
-    const prompt = w.latestAt ? sec(w.latestAt) : 0; // this session's last prompt
+    const prompt = w.latestAt ? sec(w.latestAt) : 0;
     if (marker.legacy && !upgraded.has(w.id)) {
       // Old marker without times: stamp it once.
       upgraded.add(w.id);
@@ -787,20 +870,23 @@ computed(() => {
       // changes alone don't - cmux restores sessions on restart.
       if (shelf.at && prompt > shelf.at) unsettle([w.id], false);
     } else if (s === "working" && prev !== undefined && prev !== "working" && woke.has(w.id)) {
-      dismissWoke(w.id); // sending a message (a new run starting) clears the Woke pill
+      dismissWoke(w.id);
     }
-    // Keep the last prompt time in the marker so it survives restarts.
+    if (isSelected(w)) lastOpen.set(w.id, t);
+    if (SLEEP_SETTLED) {
+      if (isSelected(w)) wakeSlept(w);
+      else if (shelf.shelf === "settled") sleepSettled(w, t);
+    }
     if (!marker.legacy && prompt > (marker.last || 0) + 1 && !shelfOverride.has(w.id)) {
       writeMarker(w.id, { ...markerFields(w), last: prompt });
     }
   }
 
-  // Auto-settle sweep, once a minute (ThreadSettlementService).
   if (t - lastSweep >= 60) {
     lastSweep = t;
     const due = ws.filter((w) => {
       if (shelfOf(w).shelf !== "active" || w.pinned || isSelected(w) || markerOf(w).manual) return false;
-      if (agentState(w) !== null) return false; // working, or a real input request
+      if (agentState(w) !== null) return false;
       const pr = prOf(w);
       if (pr && (pr.status === "closed" || (AUTO_SETTLE_ON_MERGE && pr.status === "merged"))) return true;
       const last = lastPrompt(w);
@@ -813,11 +899,10 @@ computed(() => {
   return t;
 });
 
-// --- text field submits ----------------------------------------------------------
-// cmux sends a text field's "submit" both for Return AND for focus loss, and a
-// click on any other sidebar node blurs the field first (submit, then tap, in
-// one host call). So a submit is held until the next clock tick and dropped if
-// a tap follows: Return acts, clicking elsewhere (e.g. a project row) doesn't.
+// cmux sends a text field's "submit" both for Return and for focus loss, and
+// a click on any other sidebar node blurs the field first (submit, then tap,
+// in one host call). So a submit is held until the next clock tick and dropped
+// if a tap follows: Return acts, clicking elsewhere doesn't.
 let pendingSubmit = null;
 function deferSubmit(run) {
   pendingSubmit = { run, at: now() };
@@ -840,6 +925,15 @@ function finishBlurClose() {
   if (close) close();
   if (blurred()) setBlurred(false);
 }
+// For a tap inside a popover that should leave it open. The tap blurred the
+// focus catcher, so its close is dropped and a fresh catcher mounts to take
+// focus back; without one, clicking the terminal would no longer close it.
+const [catcherGen, setCatcherGen] = signal(0);
+function keepPopoverOpen() {
+  pendingClose = null;
+  setBlurred(false);
+  setCatcherGen(catcherGen() + 1);
+}
 const hostDispatch = globalThis.__dispatch;
 globalThis.__dispatch = (nodeId, event, json) => {
   const isTap = event === "tap" || event === "doubletap";
@@ -858,7 +952,6 @@ computed(() => {
   return t;
 });
 
-// --- interaction -----------------------------------------------------------------
 function rowClick(id, payload) {
   setSnoozeMenuFor(null);
   setCustomFor(null);
@@ -884,7 +977,6 @@ function afterBulk() {
   bump();
 }
 
-// threadActionMenu.logic.ts (the items cmux can do)
 function threadMenu(id, shelf) {
   const w = () => byId(id);
   return [
@@ -892,7 +984,7 @@ function threadMenu(id, shelf) {
     Button(() => (w()?.pinned ? "Unpin thread" : "Pin thread"), () => {
       const pin = !w()?.pinned;
       for (const x of bulkIds(id)) {
-        if (pin && shelfOf(byId(x)).shelf !== "active") toActive([x], true); // pinning un-settles
+        if (pin && shelfOf(byId(x)).shelf !== "active") toActive([x], true);
         cmux("workspace.action", { action: pin ? "pin" : "unpin", workspace_id: x });
       }
       afterBulk();
@@ -920,12 +1012,11 @@ function threadMenu(id, shelf) {
   ];
 }
 
-// --- small views -----------------------------------------------------------------
 function when(cond, key, build) {
   return ForEach({ items: () => (cond() ? [key] : []), key: (k) => k }, () => build());
 }
 function ProjectBadge(dir) {
-  const color = () => projectColor(projectLabel(dir()));
+  const color = () => projectColor(dir());
   const home = () => isHome(dir());
   return Text(() => (home() ? "\u2302" : monogram(baseName(dir()) || "PR")))
     .font(() => (home() ? 11 : 8))
@@ -946,9 +1037,8 @@ function PrBadge(w) {
     .layoutPriority(2)
     .onTap(() => prOf(w())?.url && openURL(prOf(w()).url));
 }
-// Provider mark. The sidebar can only draw SF Symbols and text, so these are
-// stand-ins, not the real logos: Claude Code's own ✻ glyph, and a generic
-// symbol for Codex.
+// The sidebar can only draw SF Symbols and text, so these stand in for the
+// logos: Claude Code's ✻ glyph and a generic symbol for Codex.
 function ProviderMark(w) {
   const kind = () => agentKind(w());
   return Text(() => ({ claude: "\u273B", codex: "\u269B\uFE0E", other: "\u2726" })[kind()] ?? "")
@@ -981,29 +1071,24 @@ function ShelfHeader(label, count, expanded, toggle, tone) {
     .onTap(toggle);
 }
 
-// --- thread card (pinned + active) -------------------------------------------------
-// T3 dims working rows to 70%. (It also fades them back on hover; doing that
-// in cmux needs every dimmed part drawn twice, which doubled the cost of every
-// sidebar update and made scrolling stutter - so the dimming stays, the hover
-// fade doesn't. The Snooze/Settle hover controls are never dimmed.)
+// Working rows are dimmed like T3's, but without T3's fade-back on hover:
+// that needs every dimmed part drawn twice, which doubled the cost of every
+// sidebar update and made scrolling stutter.
 function HoverUndim(dimmed, build) {
   return build().opacity(() => (dimmed() ? 0.7 : 1));
 }
 
 function ThreadCard(id) {
   const w = () => byId(id);
-  // Per-card memos: selecting another thread or a global state bump only
-  // re-runs this card's bindings when its own selected/status/recede changed.
   const status = memo(() => topStatus(w()), (st) => (st ? st.kind : ""));
   const selected = memo(() => isSelected(w()));
   const dimmed = memo(() => status()?.kind === "working" && !selected() && !isMulti(id));
   const isReceded = memo(() => receded(w()));
   return VStack({ spacing: 0, alignment: "leading" }, [
-    // Line 1: project + status slot (hover cross-fades the status into Snooze / Settle)
     HStack({ spacing: 6 }, [
-      // Priorities (cmux splits leftover width between flexible views): the
-      // status/controls slot never shrinks (T3 shrink-0), the project label
-      // comes next, the spacer last - so nothing truncates while there's room.
+      // cmux splits leftover width between flexible views, so the status slot
+      // never shrinks, the project label comes next and the spacer last: nothing
+      // truncates while there's room.
       HoverUndim(dimmed, () => HStack({ spacing: 6 }, [
         ProjectBadge(() => w()?.directory),
         Text(() => projectName(w()))
@@ -1029,9 +1114,7 @@ function ThreadCard(id) {
           .opacity(() => (dimmed() ? 0.7 : 1))
           .hideOnHover()
           .onTap(() => status()?.kind === "woke" && dismissWoke(id)),
-        // Hover controls: always both, at full strength, whatever the status.
         HStack({ spacing: 8 }, [
-          // Woke stays visible next to the hover controls.
           Text("Woke").font(12).weight("medium")
             .color(WARNING)
             .frame({ width: () => (status()?.kind === "woke" ? undefined : 0) })
@@ -1059,7 +1142,6 @@ function ThreadCard(id) {
         ]).showOnHover(),
       ]).layoutPriority(2),
     ]).frame({ height: 20 }),
-    // Line 2: title
     HoverUndim(dimmed, () => Text(() => threadTitle(w()))
       .font(14)
       .weight(() => (isReceded() ? "regular" : "medium"))
@@ -1067,7 +1149,6 @@ function ThreadCard(id) {
       .lineLimit(1)
       .truncation("tail")
       .marquee()).paddingTop(4),
-    // Line 3: branch, PR, remote machine
     HoverUndim(dimmed, () => HStack({ spacing: 6 }, [
       Text(() => w()?.branch ?? "").font(12).color(PALETTE.faint).lineLimit(1).truncation("middle"),
       PrBadge(w),
@@ -1087,7 +1168,6 @@ function ThreadCard(id) {
     .contextMenu(threadMenu(id, "active"));
 }
 
-// --- slim row (snoozed + settled) ----------------------------------------------------
 function SlimRow(id, shelf) {
   const w = () => byId(id);
   const selected = memo(() => isSelected(w()));
@@ -1156,11 +1236,6 @@ function SnoozeMenu(id) {
       .frame({ maxWidth: "infinity" })
       .onTap(() => snooze(bulkIds(id), p.at)));
   return VStack({ spacing: 0, alignment: "leading" }, [
-    // Invisible focus catcher: it takes keyboard focus when the menu opens, so
-    // clicking the terminal (which sends the sidebar no event) blurs it and the
-    // menu closes. A click on an option arrives right after that blur and wins.
-    // Esc closes too.
-    FocusCatcher(() => snoozeMenuFor() === id, () => setSnoozeMenuFor(null)),
     ...items,
     Divider().padding(4),
     HStack({ spacing: 0 }, [Text("Custom…").font(13).lineLimit(1), Spacer({ minLength: 0 })])
@@ -1215,7 +1290,6 @@ function CustomSnooze(id) {
     .frame({ maxWidth: 260 });
 }
 
-// --- header + project picker ----------------------------------------------------------
 function homeDir() {
   return homeMemo();
 }
@@ -1242,7 +1316,6 @@ function Header() {
     ])
       .paddingHorizontal(8)
       .frame({ height: 32, maxWidth: "infinity" }),
-    // Project scope: folder icon, or the scoped project's monogram.
     ZStack({}, [
       Image("folder").font(13).color("secondary").opacity(() => (scope() ? 0 : 1)),
       ProjectBadge(() => scope()).opacity(() => (scope() ? 1 : 0)),
@@ -1257,13 +1330,12 @@ function Header() {
       const selectedDir = all().find((w) => isSelected(w))?.directory;
       if (scope()) newThread(scope());
       else if (payload && payload.shift) newThread(selectedDir);
-      else if (projects().length > 0) togglePicker("new");
+      else if (newThreadProjects().length > 0) togglePicker("new");
       else newThread(homeDir() ?? selectedDir);
     }),
   ]).paddingHorizontal(8).paddingVertical(6);
 }
 
-// Floating panel chrome: an adaptive (light/dark) material over the list.
 function Popover(content) {
   return content
     .padding(4)
@@ -1272,22 +1344,23 @@ function Popover(content) {
     .borderColor("#7f7f7f40")
     .borderWidth(1);
 }
-// Invisible focus catcher shared by every dropdown (the snooze menu's recipe).
-// It takes keyboard focus when the dropdown opens, so clicking the terminal
-// (which sends the sidebar no event) blurs it and the dropdown hides at once;
-// a click on one of the dropdown's own rows arrives right after the blur and
-// still lands. Esc closes. Typing goes here too (onEdit), for type-to-filter.
-function FocusCatcher(isOpen, close, onEdit) {
+// Invisible focus catcher for the open dropdown: it takes keyboard focus when
+// the dropdown opens, so clicking the terminal (which sends the sidebar no
+// event) blurs it and the dropdown closes. A click on an option arrives right
+// after that blur and wins. Esc closes too. It's mounted at the root, not in
+// the dropdown: cmux doesn't dispose a row a nested list mounts later, so a
+// catcher remounted inside the dropdown (keepPopoverOpen) would outlive it.
+const openMenu = () => (picker() ? "p:" + picker() : snoozeMenuFor() ? "m:" + snoozeMenuFor() : null);
+function FocusCatcher(menu) {
+  const value = menu.slice(2);
+  const [isOpen, close] = menu.startsWith("p:")
+    ? [() => picker() === value, () => setPicker(null)]
+    : [() => snoozeMenuFor() === value, () => setSnoozeMenuFor(null)];
   return TextField("", {
-    onEdit: onEdit ?? (() => {}),
     onSubmit: () => blurClose(() => { if (isOpen()) close(); }),
-    onCancel: () => close(),
+    onCancel: close,
   }).frame({ width: 1, height: 1 }).opacity(0);
 }
-// Project dropdowns ("filter by project" and "New thread in…"): the snooze
-// menu's recipe exactly - same floating slot, same fixed-width frosted box,
-// same focus catcher, rows built once when it opens, right-aligned under the
-// header buttons.
 function ProjectMenu(mode) {
   const close = () => setPicker(null);
   const choose = (dir) => {
@@ -1295,8 +1368,8 @@ function ProjectMenu(mode) {
     if (mode === "new") newThread(dir);
     else setScope(dir);
   };
-  // The label column outranks the spacer (cmux otherwise splits the free width
-  // between them and truncates names early); the checkmark sits at the end.
+  // The label column outranks the spacer, or cmux splits the free width between
+  // them and truncates names early.
   const item = (children, onTap, trailing) =>
     HStack({ spacing: 8 }, [...children, Spacer({ minLength: 8 }), ...(trailing ? [trailing] : [])])
       .paddingHorizontal(10)
@@ -1305,16 +1378,28 @@ function ProjectMenu(mode) {
       .hoverBackground("#7f7f7f24")
       .onTap(onTap);
   const check = (on) => Image("checkmark").font(11).weight("semibold").color("secondary").opacity(on ? 1 : 0);
+  const star = (dir) =>
+    Image(() => (isFavorite(dir) ? "star.fill" : "star"))
+      .font(11)
+      .color(() => (isFavorite(dir) ? WARNING : "tertiary"))
+      .padding(3)
+      .cornerRadius(5)
+      .hoverBackground(PALETTE.control)
+      .help(() => (isFavorite(dir) ? "Remove from favorites" : "Add to favorites (always listed)"))
+      .showOnHover(() => !isFavorite(dir))
+      .onTap(() => {
+        toggleFavorite(dir);
+        keepPopoverOpen();
+      });
   const label = (title, subtitle) =>
     VStack({ spacing: 0, alignment: "leading" }, [
       Text(title).font(13).lineLimit(1).truncation("tail"),
       Text(subtitle).font(11).color("tertiary").lineLimit(1).truncation("head"),
     ]).layoutPriority(1);
   const home = homeDir();
-  const projectRows = projects().map((p) =>
+  const projectRows = (mode === "new" ? newThreadProjects() : activeProjects(scope())).map((p) =>
     item([ProjectBadge(() => p.dir), label(p.name, shortPath(p.dir))],
-      () => choose(p.dir), check(mode === "scope" && scope() === p.dir)));
-  // Only in the New thread menu (the filter lists real projects only).
+      () => choose(p.dir), mode === "new" ? star(p.dir) : check(scope() === p.dir)));
   const noProjectRow = item([Image("house").font(11).color("secondary").frame({ width: 16 }), label(NO_PROJECT, "~ · home folder")],
     () => choose(home ?? "~"));
   const head = mode === "new"
@@ -1325,7 +1410,6 @@ function ProjectMenu(mode) {
       ];
   const rows = projectRows.length ? [Divider().padding(4), ...projectRows] : [];
   return VStack({ spacing: 0, alignment: "leading" }, [
-    FocusCatcher(() => picker() === mode, close),
     ...head,
     ...rows,
   ])
@@ -1337,7 +1421,6 @@ function ProjectMenu(mode) {
     .frame({ maxWidth: 260 });
 }
 
-// --- active list (drag to reorder) ------------------------------------------------------
 const noticeLive = memo(() => {
   const n = notice();
   return !!n && now() - n.at < NOTICE_SECONDS;
@@ -1354,8 +1437,8 @@ const cardEntries = memo(() => {
     if (live?.anchor?.after === w.id) place();
   }
   if (noticeEntry && !placed) {
-    if (live.anchor && live.anchor.before === null) out.push(noticeEntry); // was the last card
-    else out.unshift(noticeEntry); // not in the list: top
+    if (live.anchor && live.anchor.before === null) out.push(noticeEntry);
+    else out.unshift(noticeEntry);
   }
   return out;
 }, (list) => list.map((e) => e.key).join(","));
@@ -1366,7 +1449,6 @@ function handleMove(key, index) {
   const prev = entries.slice(0, index).reverse().find((e) => e.kind === "card");
   const order = all().map((w) => w.id);
   const from = order.indexOf(id);
-  // Dragging across the pinned boundary pins / unpins (T3 drag verbs).
   const dragged = byId(id);
   const nextPinned = next ? !!byId(next.id)?.pinned : false;
   const prevPinned = prev ? !!byId(prev.id)?.pinned : false;
@@ -1381,7 +1463,6 @@ function handleMove(key, index) {
   }
 }
 
-// --- shelves ------------------------------------------------------------------------------
 const settledExpanded = () => settledLocalExpanded();
 const toggleSettled = () => setSettledLocalExpanded(!settledLocalExpanded());
 function slimEntries(rows, shelf, expanded, limit) {
@@ -1396,8 +1477,6 @@ function slimEntries(rows, shelf, expanded, limit) {
   }
   return out;
 }
-// Top of the popover for a row: just under a card's first line (over the card,
-// like T3's menu under its clock button), or just under a slim row.
 function popoverTop(id) {
   let y = 0;
   const cards = cardEntries();
@@ -1427,7 +1506,7 @@ function FloatingAt(id, view, top) {
 }
 
 function NoticeRow() {
-  const n = notice(); // one row per notice (keyed by its time and text)
+  const n = notice();
   return HStack({ spacing: 8 }, [
     Image(n?.icon ?? "checkmark.circle").font(12).color("secondary"),
     Text(n?.text ?? "").font(12).color("secondary").lineLimit(1).truncation("tail"),
@@ -1453,7 +1532,6 @@ function entryView(e) {
   return SlimRow(entry.id, entry.kind);
 }
 
-// --- root ---------------------------------------------------------------------------------
 function ThreadList() {
   return VStack({ spacing: 0, alignment: "leading" }, [
     VStack({ spacing: 2, alignment: "leading" }, [
@@ -1494,11 +1572,14 @@ sidebar(() =>
       ThreadList(),
       ForEach({ items: () => (picker() ? [picker()] : []), key: (m) => "p:" + m }, (_, key) =>
         FloatingAt(null, ProjectMenu(key.slice(2)), () => 0)),
-      // Snooze menu / custom snooze float under the row that opened them.
       ForEach({ items: () => (snoozeMenuFor() ? [snoozeMenuFor()] : []), key: (id) => "m:" + id }, (_, key) =>
         FloatingAt(key.slice(2), SnoozeMenu(key.slice(2)))),
       ForEach({ items: () => (customFor() ? [customFor()] : []), key: (id) => "x:" + id }, (_, key) =>
         FloatingAt(key.slice(2), CustomSnooze(key.slice(2)))),
+      ForEach({ items: () => (openMenu() ? [{ menu: openMenu(), gen: catcherGen() }] : []), key: (c) => c.menu + "#" + c.gen }, (c) => {
+        const id = c().menu.startsWith("m:") ? c().menu.slice(2) : null;
+        return FloatingAt(id, FocusCatcher(c().menu), id ? undefined : () => 0);
+      }),
     ]),
   ])
 );

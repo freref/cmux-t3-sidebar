@@ -2,6 +2,7 @@ const AUTO_SETTLE_AFTER_DAYS = 3; // null = never
 const AUTO_SETTLE_ON_MERGE = true; // closed PRs always settle
 const SLEEP_SETTLED = true; // settled threads exit Claude; opening one resumes it
 const CLOSE_SETTLED_AFTER_DAYS = null; // close a settled thread this long after it settled; null = keep it
+const NEW_THREAD_COMMAND = "claude"; // run in a new thread's terminal; null = plain shell
 const SETTLED_PAGE = 10;
 const SETTLED_STEP = 25;
 const NOTICE_SECONDS = 5;
@@ -567,9 +568,10 @@ function selectWorkspace(id) {
   bump();
   cmux("workspace.select", { workspace_id: id });
 }
-function newThread(dir) {
+function newThread(dir, command = NEW_THREAD_COMMAND) {
   const params = { focus: "true" };
   if (dir) params.working_directory = dir;
+  if (command) params.initial_input = command + "\r";
   cmux("workspace.create", params);
 }
 function anchorForRemoval(ids) {
@@ -581,7 +583,7 @@ function anchorForRemoval(ids) {
 }
 // Settling/snoozing the open thread moves to the next card (wrapping), or,
 // when none is left, opens a fresh "No project" thread, not a copy of the one
-// just settled.
+// just settled, and without Claude: you didn't ask for a new session.
 function moveSelectionAway(ids) {
   const selected = all().find((w) => isSelected(w));
   if (!selected || !ids.includes(selected.id)) return;
@@ -591,7 +593,7 @@ function moveSelectionAway(ids) {
     const next = cards[(start + i + cards.length) % cards.length];
     if (next && !ids.includes(next)) return selectWorkspace(next);
   }
-  newThread(homeDir() ?? "~");
+  newThread(homeDir() ?? "~", null);
 }
 
 function settle(ids, auto) {

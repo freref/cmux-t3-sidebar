@@ -27,4 +27,4 @@ Requires cmux 0.64.25 or later.
 
 Settled threads don't keep Claude running: the sidebar exits it, and starts the same session again when you open the thread.
 
-Settings such as auto-settle days, sleeping settled threads, closing settled threads after a number of days (`CLOSE_SETTLED_AFTER_DAYS`, off by default: every settled thread keeps a terminal, so a hundred of them cost real memory), and light or dark mode are at the top of `t3code.js`.
+Settings such as the command a new thread starts with (`NEW_THREAD_COMMAND`, `claude` by default), auto-settle days, sleeping settled threads, closing settled threads after a number of days (`CLOSE_SETTLED_AFTER_DAYS`, off by default: every settled thread keeps a terminal, so a hundred of them cost real memory), and light or dark mode are at the top of `t3code.js`.

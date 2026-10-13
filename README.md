@@ -17,7 +17,7 @@ Requires cmux 0.64.25 or later.
 
 2. In cmux, right-click the sidebar toggle and pick **t3code**.
 3. Recommended: merge `cmux.example.json` into `~/.config/cmux/cmux.json`. It turns on Agent Hibernation, which pauses idle agents and resumes them with `claude --resume` when you open their thread again. It also sets a matching background and names threads after their conversation.
-4. Recommended: install the Claude Code hook. Without it, a thread stays **Working** after you interrupt Claude, and a settled thread's Claude comes back without its original flags (see below):
+4. Recommended: install the Claude Code hook. Without it, a thread stays **Working** after you interrupt Claude or `/fork` it, a thread you fork with cmux's Fork Conversation loses **Working** until Claude's next step, a thread whose Claude waits on a monitor or other background task doesn't show **Monitoring** (and can be put to sleep, which ends that task), and a settled thread's Claude comes back without its original flags (see below):
 
    ```bash
    cp claude-turn-end.sh ~/.config/cmux/ && chmod +x ~/.config/cmux/claude-turn-end.sh
@@ -27,4 +27,4 @@ Requires cmux 0.64.25 or later.
 
 Settled threads don't keep Claude running: the sidebar exits it, and starts the same session again when you open the thread.
 
-Settings such as auto-settle days, sleeping settled threads, and light or dark mode are at the top of `t3code.js`.
+Settings such as auto-settle days, sleeping settled threads, closing settled threads after a number of days (`CLOSE_SETTLED_AFTER_DAYS`, off by default: every settled thread keeps a terminal, so a hundred of them cost real memory), and light or dark mode are at the top of `t3code.js`.

@@ -1,6 +1,7 @@
 const AUTO_SETTLE_AFTER_DAYS = 3; // null = never
 const AUTO_SETTLE_ON_MERGE = true; // closed PRs always settle
 const SLEEP_SETTLED = true; // settled threads exit Claude; opening one resumes it
+const CLOSE_SETTLED_AFTER_DAYS = null; // close a settled thread this long after it settled; null = keep it
 const SETTLED_PAGE = 10;
 const SETTLED_STEP = 25;
 const NOTICE_SECONDS = 5;
@@ -10,6 +11,7 @@ const INFO = "#3b82f6";
 const SUCCESS = "#10b981";
 const WARNING = "#f59e0b";
 const INPUT = "#6366f1";
+const BACKGROUND = "#06b6d4";
 // The sidebar can't tell light from dark mode.
 const APPEARANCE = "light"; // "light" | "dark"
 const PALETTE = {
@@ -261,6 +263,17 @@ function agentState(w) {
   if (agents.some((a) => isWorking(w, a))) return "working";
   return null;
 }
+// cmux knows when Claude is idle with background work still running (a
+// monitor, a background command or agent), which ends with Claude, but doesn't
+// tell custom sidebars. claude-turn-end.sh puts it in the workspace's progress
+// label instead: "Background: 1 monitor, 2 shells — <what they do>". cmux
+// keeps progress across restarts, so it only counts while Claude runs.
+const BACKGROUND_LABEL = /^Background: (.+?)(?: — (.*))?$/;
+function backgroundWork(w) {
+  const m = BACKGROUND_LABEL.exec(w?.progress?.label ?? "");
+  if (!m || !runningClaude(w)) return null;
+  return { tasks: m[1], what: m[2] ?? "", monitor: /\bmonitors?\b/.test(m[1]) };
+}
 // cmux restarts sinceEpoch on every prompt, including one you send to steer a
 // running turn, so "Working" counts from the start of the unbroken run instead.
 // A gap of a few seconds still counts as the same run: a message queued while
@@ -442,6 +455,8 @@ function topStatus(w) {
   if (s === "input") return { kind: "input", icon: "questionmark.bubble", color: INPUT, text: "Input" };
   if (s === "working") return { kind: "working", icon: "circle.dashed", color: INFO, text: "Working" };
   if (isWoke(w?.id)) return { kind: "woke", icon: "alarm", color: WARNING, text: "Woke" };
+  const bg = backgroundWork(w);
+  if (bg) return { kind: "background", icon: bg.monitor ? "waveform.path.ecg" : "hourglass", color: BACKGROUND, text: bg.monitor ? "Monitoring" : "Background" };
   if ((w?.unread ?? 0) > 0) return { kind: "done", icon: "checkmark.circle", color: SUCCESS, text: "Done" };
   return null;
 }
@@ -685,21 +700,33 @@ function dismissWoke(id) {
 // Claude is exited (Ctrl+C clears an unsent draft, then /exit). Opening the
 // thread starts the same session again with the resume command
 // claude-turn-end.sh saved for it (same flags and permission mode). The marker
-// remembers it: slept=<when> pid=<the Claude process that was exited>.
+// remembers it: slept=<when> pid=<the Claude process that was exited>. A
+// Claude with background work still running is left alone: exiting would end it.
 const SLEEP_GRACE = 600; // seconds since you last had the thread open
 const RESUME_SCRIPT = "~/.config/cmux/claude-turn-end.sh";
-const sleepSteps = new Map(); // id -> when Ctrl+C was sent
+const sleepSteps = new Map(); // id -> { at: when Ctrl+C was sent, pid, tries, sent }
 const lastOpen = new Map(); // id -> when it was last the selected thread
 const resumeTyped = new Set();
-const claudeAgent = (w) => (w?.agents ?? []).find((a) => String(a.kind ?? "").toLowerCase().includes("claude"));
-// The thread's running Claude. cmux doesn't always notice Claude exiting (a
-// session still at the folder-trust prompt never reports it), so the process a
-// thread was put to sleep from doesn't count, even if cmux still lists it.
-function runningClaude(w) {
-  const a = claudeAgent(w);
-  if (!a || a.status === "ended") return null;
+const isClaude = (a) => String(a.kind ?? "").toLowerCase().includes("claude");
+const claudeAgent = (w) => (w?.agents ?? []).find(isClaude);
+// The thread's running Claudes (one per pane, at most). cmux doesn't always
+// notice Claude exiting (a session still at the folder-trust prompt never
+// reports it), so the process a thread was put to sleep from doesn't count,
+// even if cmux still lists it.
+function runningClaudes(w) {
   const f = markerFields(w);
-  return f.slept && (!f.pid || f.pid === a.pid) ? null : a;
+  return liveAgents(w).filter((a) => isClaude(a) && !(f.slept && f.pid && f.pid === a.pid));
+}
+const runningClaude = (w) => runningClaudes(w)[0] ?? null;
+// cmux (0.64) sometimes lists no agent for a thread whose Claude still runs
+// (its session fell out of the agent index). Claude Code's own tab title
+// gives it away: ✳ idle, ◐◑◒◓ working. That tab is exited the same way, once
+// per settle.
+const CLAUDE_TAB_TITLE = /^[\u2722-\u273D\u25D0-\u25D3]/;
+function unseenClaude(w, panelId) {
+  if (liveAgents(w).some(isClaude)) return null;
+  const tab = (w.tabs ?? []).find((x) => (!panelId || x.id === panelId) && CLAUDE_TAB_TITLE.test(x.title ?? ""));
+  return tab ? { panelId: tab.id, pid: 0, unseen: true } : null;
 }
 // surface.send_text / send_key take the panel id (a tab's `id`, an agent's
 // `panelId`), not the `surfaceId` the sidebar data also carries.
@@ -707,24 +734,46 @@ function typeInto(w, panelId, text, enter) {
   cmux("surface.send_text", { workspace_id: w.id, surface_id: panelId, text });
   if (enter) cmux("surface.send_key", { workspace_id: w.id, surface_id: panelId, key: "enter" });
 }
+// Ctrl+C clears the prompt, /exit ends the session. /exit can ask a question
+// first (keep or remove the session's worktree), so Enter follows to take its
+// default. cmux then reports the agent ended; if it hasn't after a while, the
+// keys went astray (a dialog, a pane without Claude): try again, three times
+// in all, then give up and treat it as asleep.
 function sleepSettled(w, t) {
-  const a = runningClaude(w);
+  const step = sleepSteps.get(w.id);
+  const a = step
+    ? step.unseen ? unseenClaude(w, step.panel) : runningClaudes(w).find((x) => (x.pid ?? 0) === step.pid)
+    : runningClaude(w) ?? (markerFields(w).slept ? null : unseenClaude(w));
+  if (step && !a) {
+    writeMarker(w.id, { ...markerFields(w), slept: t, pid: step.pid });
+    sleepSteps.delete(w.id);
+    return;
+  }
   const ready =
-    a && a.panelId && agentState(w) === null &&
+    a && a.panelId && agentState(w) === null && !backgroundWork(w) &&
     !(a.children ?? []).some((c) => c.running) &&
     !shelfOverride.has(w.id) && t - (shelfOf(w).at ?? 0) >= NOTICE_SECONDS + 5 &&
     t - (lastOpen.get(w.id) ?? 0) >= SLEEP_GRACE;
-  const ctrlC = sleepSteps.get(w.id);
   if (!ready) {
     sleepSteps.delete(w.id);
-  } else if (!ctrlC) {
+  } else if (!step) {
     typeInto(w, a.panelId, "\u0003");
-    sleepSteps.set(w.id, t);
-  } else if (t - ctrlC >= 1) {
+    sleepSteps.set(w.id, { at: t, pid: a.pid ?? 0, panel: a.panelId, unseen: !!a.unseen, tries: 1, sent: 0 });
+  } else if (step.sent < 1 && t - step.at >= 1) {
     typeInto(w, a.panelId, "/exit", true);
     resumeTyped.delete(w.id);
-    writeMarker(w.id, { ...markerFields(w), slept: t, pid: a.pid ?? 0 });
-    sleepSteps.delete(w.id);
+    step.sent = 1;
+  } else if (step.sent < 2 && t - step.at >= 3) {
+    cmux("surface.send_key", { workspace_id: w.id, surface_id: a.panelId, key: "enter" });
+    step.sent = 2;
+  } else if (t - step.at >= 12) {
+    if (step.tries >= 3) {
+      writeMarker(w.id, { ...markerFields(w), slept: t, pid: step.pid });
+      sleepSteps.delete(w.id);
+    } else {
+      typeInto(w, a.panelId, "\u0003");
+      sleepSteps.set(w.id, { ...step, at: t, tries: step.tries + 1, sent: 0 });
+    }
   }
 }
 function wakeSlept(w) {
@@ -813,6 +862,7 @@ function syncOrder(ws) {
 
 const prevStatus = new Map();
 const upgraded = new Set();
+const closing = new Set();
 let lastSweep = 0;
 computed(() => {
   const t = now();
@@ -869,6 +919,13 @@ computed(() => {
       // Only a prompt you sent after settling brings it back (T3). Agent state
       // changes alone don't - cmux restores sessions on restart.
       if (shelf.at && prompt > shelf.at) unsettle([w.id], false);
+      else if (
+        CLOSE_SETTLED_AFTER_DAYS != null && shelf.at && t - shelf.at >= CLOSE_SETTLED_AFTER_DAYS * 86400 &&
+        !isSelected(w) && s === null && !backgroundWork(w) && !closing.has(w.id)
+      ) {
+        closing.add(w.id);
+        cmux("workspace.close", { workspace_id: w.id });
+      }
     } else if (s === "working" && prev !== undefined && prev !== "working" && woke.has(w.id)) {
       dismissWoke(w.id);
     }
@@ -886,7 +943,8 @@ computed(() => {
     lastSweep = t;
     const due = ws.filter((w) => {
       if (shelfOf(w).shelf !== "active" || w.pinned || isSelected(w) || markerOf(w).manual) return false;
-      if (agentState(w) !== null) return false;
+      // Background work too: a merged PR's thread can still be watching the deploy.
+      if (agentState(w) !== null || backgroundWork(w)) return false;
       const pr = prOf(w);
       if (pr && (pr.status === "closed" || (AUTO_SETTLE_ON_MERGE && pr.status === "merged"))) return true;
       const last = lastPrompt(w);
@@ -1046,7 +1104,11 @@ function ProviderMark(w) {
     .color(() => (kind() === "claude" ? "#D97757" : "secondary"))
     .opacity(() => (kind() === "claude" ? 1 : 0.6))
     .frame({ width: () => (kind() ? 14 : 0), height: 14 })
-    .help(() => liveAgents(w())[0]?.name ?? "");
+    .help(() => {
+      const name = liveAgents(w())[0]?.name ?? "";
+      const bg = backgroundWork(w());
+      return bg ? name + " · " + bg.tasks + (bg.what ? ": " + bg.what : "") : name;
+    });
 }
 function IconButton(icon, help, onTap) {
   return Image(icon)
@@ -1080,7 +1142,7 @@ function HoverUndim(dimmed, build) {
 
 function ThreadCard(id) {
   const w = () => byId(id);
-  const status = memo(() => topStatus(w()), (st) => (st ? st.kind : ""));
+  const status = memo(() => topStatus(w()), (st) => (st ? st.kind + st.text : ""));
   const selected = memo(() => isSelected(w()));
   const dimmed = memo(() => status()?.kind === "working" && !selected() && !isMulti(id));
   const isReceded = memo(() => receded(w()));

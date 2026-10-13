@@ -714,10 +714,12 @@ const claudeAgent = (w) => (w?.agents ?? []).find(isClaude);
 // The thread's running Claudes (one per pane, at most). cmux doesn't always
 // notice Claude exiting (a session still at the folder-trust prompt never
 // reports it), so the process a thread was put to sleep from doesn't count,
-// even if cmux still lists it.
+// even if cmux still lists it. cmux can also keep a Claude that's gone as idle
+// with no pid; when that's what the thread was put to sleep from, no pid-less
+// agent counts, or the sidebar would keep typing /exit into the shell.
 function runningClaudes(w) {
   const f = markerFields(w);
-  return liveAgents(w).filter((a) => isClaude(a) && !(f.slept && f.pid && f.pid === a.pid));
+  return liveAgents(w).filter((a) => isClaude(a) && !(f.slept && (f.pid ? f.pid === a.pid : !a.pid)));
 }
 const runningClaude = (w) => runningClaudes(w)[0] ?? null;
 // cmux (0.64) sometimes lists no agent for a thread whose Claude still runs

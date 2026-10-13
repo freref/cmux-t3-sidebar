@@ -7,7 +7,7 @@
 
 ## Setup
 
-Requires cmux 0.64.25 or later.
+Requires cmux 0.65.0 or later.
 
 1. Copy `t3code.js` into cmux's sidebars folder:
 

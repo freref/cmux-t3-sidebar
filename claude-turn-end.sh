@@ -9,9 +9,8 @@
 # Claude Code rewrites its own status file (~/.claude/sessions/<pid>.json) on
 # every busy/idle change: this hook watches it, and when Claude is idle while the
 # turn it saw start never got a Stop, it sends cmux the Stop it missed. It also
-# forwards StopFailure (a turn that died on an API error), which cmux 0.64 does
-# not listen for, takes a pane back for its session after a /fork (see
-# reclaim), and puts a session cmux forked back on its own pane (see rebind).
+# takes a pane back for its session after a /fork (see reclaim), and puts a
+# session cmux forked back on its own pane (see rebind).
 #
 # cmux knows when Claude is idle with a monitor or other background task still
 # running, but doesn't tell custom sidebars. This hook does, through the
@@ -211,14 +210,10 @@ case "$event" in
     save_resume # before cmux drops the binding, when it's still there
     ;;
   StopFailure)
+    # cmux shows the API error itself. The turn is over all the same, or the
+    # next FileChanged would send a Stop over that error.
     reclaim
     rm -f "$turn"
-    # Newer cmux registers StopFailure itself and shows it as an error. cmux
-    # 0.64 doesn't know the event, so hand it the Stop this replaces: its
-    # notification then reads the API error (last_assistant_message).
-    cmux hooks claude inject-settings | grep -q '"StopFailure"' && exit 0
-    from='"hook_event_name":"StopFailure"' to='"hook_event_name":"Stop"'
-    printf '%s' "${input/$from/$to}" | cmux hooks claude stop >/dev/null
     ;;
   FileChanged)
     # Background commands that ended without a turn of their own (you stopped

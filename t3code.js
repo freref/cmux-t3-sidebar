@@ -698,28 +698,53 @@ function dismissWoke(id) {
 }
 
 // Settled threads don't keep Claude running. Once the Undo notice is gone (or,
-// for a settled thread you reopened, 10 minutes after you left it), its idle
-// Claude is exited (Ctrl+C clears an unsent draft, then /exit). Opening the
-// thread starts the same session again with the resume command
-// claude-turn-end.sh saved for it (same flags and permission mode). The marker
-// remembers it: slept=<when> pid=<the Claude process that was exited>. A
-// Claude with background work still running is left alone: exiting would end it.
+// for a settled thread you reopened, 10 minutes after you left it), each of its
+// idle Claudes is exited in turn (Ctrl+C clears an unsent draft, then /exit).
+// Opening the thread starts every one of them again in its own tab, with the
+// resume command claude-turn-end.sh saved for its session (same flags and
+// permission mode). The marker says the thread sleeps (slept=<when>), and a
+// "[t3:slept <panel> <tab> <session> <pid>]" line above it keeps each Claude
+// that was exited: its tab's panel id and position in the thread, its session
+// ("-" if unknown) and its process. cmux forgets a session once Claude exits,
+// and gives every tab a new panel id when it relaunches, so the sidebar can't
+// ask cmux which tabs to resume. A Claude with background work still running
+// is left alone: exiting would end it.
 const SLEEP_GRACE = 600; // seconds since you last had the thread open
 const RESUME_SCRIPT = "~/.config/cmux/claude-turn-end.sh";
-const sleepSteps = new Map(); // id -> { at: when Ctrl+C was sent, pid, tries, sent }
+const sleepSteps = new Map(); // id -> { at: when Ctrl+C was sent, pid, panel, session, tries, sent }
 const lastOpen = new Map(); // id -> when it was last the selected thread
 const resumeTyped = new Set();
 const isClaude = (a) => String(a.kind ?? "").toLowerCase().includes("claude");
 const claudeAgent = (w) => (w?.agents ?? []).find(isClaude);
-// The thread's running Claudes (one per pane, at most). cmux doesn't always
+const SLEPT_RE = /^\[t3:slept (\S+) (\d+) (\S+) (\d+)\]$/;
+function sleptTabs(w) {
+  return descriptionOf(w)
+    .split("\n")
+    .map((l) => SLEPT_RE.exec(l))
+    .filter(Boolean)
+    .map(([, panel, tab, session, pid]) => ({ panel, tab: +tab, session: session === "-" ? "" : session, pid: +pid }));
+}
+function writeSleptTabs(w, slept) {
+  const current = descriptionOf(w);
+  const m = MARKER_RE.exec(current);
+  const base = (m ? current.slice(0, m.index) : current).split("\n").filter((l) => !SLEPT_RE.test(l)).join("\n");
+  const lines = slept.map((s) => `[t3:slept ${s.panel} ${s.tab} ${s.session || "-"} ${s.pid}]`);
+  setDescription(w.id, current, [base, ...lines, m ? m[0].trim() : ""].filter(Boolean).join("\n"));
+}
+// The thread's running Claudes (one per tab, at most). cmux doesn't always
 // notice Claude exiting (a session still at the folder-trust prompt never
-// reports it), so the process a thread was put to sleep from doesn't count,
+// reports it), so a process the thread was put to sleep from doesn't count,
 // even if cmux still lists it. cmux can also keep a Claude that's gone as idle
-// with no pid; when that's what the thread was put to sleep from, no pid-less
-// agent counts, or the sidebar would keep typing /exit into the shell.
+// with no pid; when that's what a tab was put to sleep from, no pid-less agent
+// in that tab counts, or the sidebar would keep typing /exit into the shell.
+// Threads put to sleep before the per-tab lines keep one pid in the marker.
 function runningClaudes(w) {
   const f = markerFields(w);
-  return liveAgents(w).filter((a) => isClaude(a) && !(f.slept && (f.pid ? f.pid === a.pid : !a.pid)));
+  const slept = sleptTabs(w);
+  const asleep = (a) =>
+    slept.some((s) => s.panel === a.panelId && (s.pid ? s.pid === a.pid : !a.pid)) ||
+    (!!f.slept && (f.pid ? f.pid === a.pid : !slept.length && !a.pid));
+  return liveAgents(w).filter((a) => isClaude(a) && !asleep(a));
 }
 const runningClaude = (w) => runningClaudes(w)[0] ?? null;
 // cmux (0.64) sometimes lists no agent for a thread whose Claude still runs
@@ -749,8 +774,7 @@ function sleepSettled(w, t) {
     ? step.unseen ? unseenClaude(w, step.panel) : runningClaudes(w).find((x) => (x.pid ?? 0) === step.pid)
     : runningClaude(w) ?? (markerFields(w).slept ? null : unseenClaude(w));
   if (step && !a) {
-    writeMarker(w.id, { ...markerFields(w), slept: t, pid: step.pid });
-    sleepSteps.delete(w.id);
+    markSlept(w, step, t);
     return;
   }
   const ready =
@@ -762,7 +786,7 @@ function sleepSettled(w, t) {
     sleepSteps.delete(w.id);
   } else if (!step) {
     typeInto(w, a.panelId, "\u0003");
-    sleepSteps.set(w.id, { at: t, pid: a.pid ?? 0, panel: a.panelId, unseen: !!a.unseen, tries: 1, sent: 0 });
+    sleepSteps.set(w.id, { at: t, pid: a.pid ?? 0, panel: a.panelId, session: a.unseen ? "" : a.id, unseen: !!a.unseen, tries: 1, sent: 0 });
   } else if (step.sent < 1 && t - step.at >= 1) {
     typeInto(w, a.panelId, "/exit", true);
     resumeTyped.delete(w.id);
@@ -772,27 +796,52 @@ function sleepSettled(w, t) {
     step.sent = 2;
   } else if (t - step.at >= 12) {
     if (step.tries >= 3) {
-      writeMarker(w.id, { ...markerFields(w), slept: t, pid: step.pid });
-      sleepSteps.delete(w.id);
+      markSlept(w, step, t);
     } else {
       typeInto(w, a.panelId, "\u0003");
       sleepSteps.set(w.id, { ...step, at: t, tries: step.tries + 1, sent: 0 });
     }
   }
 }
+function markSlept(w, step, t) {
+  sleepSteps.delete(w.id);
+  const tab = (w.tabs ?? []).findIndex((x) => x.id === step.panel);
+  if (tab < 0) return; // closed meanwhile: nothing to resume
+  const session = /^[\w-]+$/.test(step.session ?? "") ? step.session : "";
+  const others = sleptTabs(w).filter((s) => s.panel !== step.panel);
+  writeSleptTabs(w, [...others, { panel: step.panel, tab, session, pid: step.pid }]);
+  writeMarker(w.id, { ...markerFields(w), slept: t });
+}
+// Each tab is found by its panel id or, once cmux has relaunched (none of them
+// match), by its position. A tab where Claude still runs (a sleep that never
+// took, or one cmux resumed itself) is skipped: typing there would send the
+// command to Claude as a prompt.
 function wakeSlept(w) {
   const f = markerFields(w);
-  if (!f.slept) return;
-  // Running again already (you started it, or cmux restored it).
-  if (runningClaude(w)) return writeMarker(w.id, { ...f, slept: 0, pid: 0 });
-  if (resumeTyped.has(w.id)) return;
-  const a = claudeAgent(w);
-  const panelId = a?.panelId ?? (w.tabs ?? []).find((x) => x.directory)?.id;
-  if (!panelId) return;
-  const id = /^[\w-]+$/.test(a?.id ?? "") ? a.id : "";
-  const fallback = id ? "claude --resume " + id : "claude --continue";
-  typeInto(w, panelId, `if [ -x ${RESUME_SCRIPT} ]; then ${RESUME_SCRIPT} resume ${id}; else ${fallback}; fi`, true);
+  const tabs = w.tabs ?? [];
+  if (!f.slept || resumeTyped.has(w.id) || !tabs.length) return;
+  let slept = sleptTabs(w);
+  const legacy = !slept.length;
+  if (legacy) {
+    // Put to sleep by an older version: just the Claude cmux still lists.
+    if (runningClaude(w)) return writeMarker(w.id, { ...f, slept: 0, pid: 0 });
+    const a = claudeAgent(w);
+    const panel = a?.panelId ?? tabs.find((x) => x.directory)?.id;
+    if (!panel) return;
+    slept = [{ panel, tab: 0, session: a?.id ?? "", pid: 0 }];
+  }
+  const relaunched = !slept.some((s) => tabs.some((x) => x.id === s.panel));
+  for (const s of slept) {
+    const tab = relaunched ? tabs[s.tab] : tabs.find((x) => x.id === s.panel);
+    if (!tab || CLAUDE_TAB_TITLE.test(tab.title ?? "")) continue;
+    // The pid-less ghost a tab was put to sleep from (see runningClaudes) is gone.
+    if (!legacy && liveAgents(w).some((a) => isClaude(a) && a.panelId === tab.id && (s.pid || a.pid))) continue;
+    const id = /^[\w-]+$/.test(s.session) ? s.session : "";
+    const fallback = id ? "claude --resume " + id : "cmux restore --surface";
+    typeInto(w, tab.id, `if [ -x ${RESUME_SCRIPT} ]; then ${RESUME_SCRIPT} resume ${id}; else ${fallback}; fi`, true);
+  }
   resumeTyped.add(w.id);
+  if (!legacy) writeSleptTabs(w, []);
   writeMarker(w.id, { ...f, slept: 0, pid: 0 });
 }
 

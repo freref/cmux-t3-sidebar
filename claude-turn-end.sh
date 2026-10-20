@@ -8,9 +8,11 @@
 # prompt), so the thread stays "working" (or "Input") until your next prompt.
 # Claude Code rewrites its own status file (~/.claude/sessions/<pid>.json) on
 # every busy/idle change: this hook watches it, and when Claude is idle while the
-# turn it saw start never got a Stop, it sends cmux the Stop it missed. It also
-# takes a pane back for its session after a /fork (see reclaim), and puts a
-# session cmux forked back on its own pane (see rebind).
+# turn it saw start never got a Stop, it sends cmux the Stop it missed. A turn
+# that dies on an API error (StopFailure) ends as "working" for custom sidebars
+# too, so it tells them that one ended. It also takes a pane back for its
+# session after a /fork (see reclaim), and puts a session cmux forked back on
+# its own pane (see rebind).
 #
 # cmux knows when Claude is idle with a monitor or other background task still
 # running, but doesn't tell custom sidebars. This hook does, through the
@@ -88,6 +90,13 @@ reclaim() {
     "$session" "$(field transcript_path)" "$(field cwd)" | cmux hooks claude session-start >/dev/null
   printf '%s' "$session" >"$owner_file"
 }
+# feed <event> <session> <transcript> <cwd> <surface> <workspace>: one hook
+# event on cmux's feed path only, which its agent registry (what custom
+# sidebars list) takes in: no notification, Completed or status of its own.
+feed() {
+  printf '{"session_id":"%s","hook_event_name":"%s","transcript_path":"%s","cwd":"%s","surface_id":"%s","workspace_id":"%s"}' \
+    "$2" "$1" "$3" "$4" "$5" "$6" | cmux hooks feed --source claude
+}
 # cmux's own fork (Fork Conversation to a new workspace, tab or split) tells
 # its agent registry that the forked session now runs in the fork's pane, so
 # that session's agent moves there, idle, until its next hook event: its own
@@ -106,10 +115,8 @@ rebind() { # rebind <forked session>
     idle | shell) event=Stop ;;
     *) return 0 ;;
   esac
-  # The feed path only: no notification, Completed or Idle status of its own.
-  printf '{"session_id":"%s","hook_event_name":"%s","transcript_path":"%s","cwd":"%s","surface_id":"%s","workspace_id":"%s"}' \
-    "$1" "$event" "$(field sessions.0.transcript_path "$rec")" "$(field sessions.0.cwd "$rec")" "$surface" "$workspace" |
-    CMUX_CLAUDE_PID=$pid CMUX_SURFACE_ID=$surface CMUX_WORKSPACE_ID=$workspace cmux hooks feed --source claude
+  CMUX_CLAUDE_PID=$pid CMUX_SURFACE_ID=$surface CMUX_WORKSPACE_ID=$workspace \
+    feed "$event" "$1" "$(field sessions.0.transcript_path "$rec")" "$(field sessions.0.cwd "$rec")" "$surface" "$workspace"
 }
 
 # cmux's resume binding for this session as one shell line:
@@ -214,6 +221,11 @@ case "$event" in
     # next FileChanged would send a Stop over that error.
     reclaim
     rm -f "$turn"
+    # cmux's feed takes the error for a tool call, so its agent registry keeps
+    # the session working until the next Stop. Send the feed one, once cmux has
+    # taken in its own event, unless a new turn started meanwhile.
+    { sleep 3; [ ! -f "$turn" ] && idle &&
+      feed Stop "$session" "$(field transcript_path)" "$(field cwd)" "$CMUX_SURFACE_ID" "$CMUX_WORKSPACE_ID"; } >/dev/null 2>&1 &
     ;;
   FileChanged)
     # Background commands that ended without a turn of their own (you stopped

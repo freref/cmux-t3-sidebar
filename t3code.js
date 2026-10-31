@@ -2,7 +2,9 @@ const AUTO_SETTLE_AFTER_DAYS = 3; // null = never
 const AUTO_SETTLE_ON_MERGE = true; // closed PRs always settle
 const SLEEP_SETTLED = true; // settled threads exit Claude; opening one resumes it
 const CLOSE_SETTLED_AFTER_DAYS = null; // close a settled thread this long after it settled; null = keep it
+const MAX_SETTLED_THREADS = 50; // close the oldest settled threads beyond this many; null = keep them all
 const NEW_THREAD_COMMAND = "claude"; // run in a new project thread's terminal ("No project" ones stay a plain shell); null = plain shell
+const SPLIT_NEW_THREAD_RATIO = 2; // a new thread opens as two panes side by side, both running its command, when the window is at least this many times wider than tall; null = one pane
 const SETTLED_PAGE = 10;
 const SETTLED_STEP = 25;
 const NOTICE_SECONDS = 5;
@@ -568,10 +570,21 @@ function selectWorkspace(id) {
   bump();
   cmux("workspace.select", { workspace_id: id });
 }
+const shellQuote = (s) => "'" + s.replace(/'/g, "'\\''") + "'";
+// The sidebar can't see the window's size, so the new terminal checks it and
+// splits itself. The leading space keeps the check out of history in shells
+// that skip space-prefixed commands (zsh's hist_ignore_space).
 function newThread(dir) {
   const params = { focus: "true" };
   if (dir) params.working_directory = dir;
-  if (NEW_THREAD_COMMAND && !isHome(dir) && dir !== "~") params.initial_input = NEW_THREAD_COMMAND + "\r";
+  const command = NEW_THREAD_COMMAND && !isHome(dir) && dir !== "~" ? NEW_THREAD_COMMAND : "";
+  if (SPLIT_NEW_THREAD_RATIO != null) {
+    const wide = `cmux resize-window --window "$(cmux current-window)" | awk '{exit $2 < ${SPLIT_NEW_THREAD_RATIO} * $3}'`;
+    const split = "cmux new-split right --focus false" + (command ? " --command " + shellQuote(command) : "") + " >/dev/null";
+    params.initial_input = ` ${wide} && ${split}; clear` + (command ? "; " + command : "") + "\r";
+  } else if (command) {
+    params.initial_input = command + "\r";
+  }
   cmux("workspace.create", params);
 }
 function anchorForRemoval(ids) {
@@ -915,7 +928,16 @@ function syncOrder(ws) {
 
 const prevStatus = new Map();
 const upgraded = new Set();
-const closing = new Set();
+// cmux won't close a thread that still runs something (a Claude not asleep
+// yet, a dev server), so a refused close is asked again later.
+const CLOSE_RETRY = 600;
+const closing = new Map(); // workspace id -> when we last asked cmux to close it
+function closeSettled(w, t) {
+  if (isSelected(w) || agentState(w) !== null || backgroundWork(w)) return;
+  if (closing.has(w.id) && t - closing.get(w.id) < CLOSE_RETRY) return;
+  closing.set(w.id, t);
+  cmux("workspace.close", { workspace_id: w.id });
+}
 let lastSweep = 0;
 computed(() => {
   const t = now();
@@ -972,12 +994,8 @@ computed(() => {
       // Only a prompt you sent after settling brings it back (T3). Agent state
       // changes alone don't - cmux restores sessions on restart.
       if (shelf.at && prompt > shelf.at) unsettle([w.id], false);
-      else if (
-        CLOSE_SETTLED_AFTER_DAYS != null && shelf.at && t - shelf.at >= CLOSE_SETTLED_AFTER_DAYS * 86400 &&
-        !isSelected(w) && s === null && !backgroundWork(w) && !closing.has(w.id)
-      ) {
-        closing.add(w.id);
-        cmux("workspace.close", { workspace_id: w.id });
+      else if (CLOSE_SETTLED_AFTER_DAYS != null && shelf.at && t - shelf.at >= CLOSE_SETTLED_AFTER_DAYS * 86400) {
+        closeSettled(w, t);
       }
     } else if (s === "working" && prev !== undefined && prev !== "working" && woke.has(w.id)) {
       dismissWoke(w.id);
@@ -1004,6 +1022,15 @@ computed(() => {
       return AUTO_SETTLE_AFTER_DAYS != null && last > 0 && t - last >= AUTO_SETTLE_AFTER_DAYS * 86400;
     });
     if (due.length) settle(due.map((w) => w.id), true);
+    if (MAX_SETTLED_THREADS != null) {
+      const settled = [];
+      for (const w of ws) {
+        const shelf = shelfOf(w);
+        if (shelf.shelf === "settled") settled.push({ w, at: shelf.at ?? 0 });
+      }
+      settled.sort((a, b) => b.at - a.at);
+      for (const x of settled.slice(MAX_SETTLED_THREADS)) closeSettled(x.w, t);
+    }
   }
 
   syncOrder(ws);

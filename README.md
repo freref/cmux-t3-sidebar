@@ -17,7 +17,7 @@ Requires cmux 0.65.0 or later.
 
 2. In cmux, right-click the sidebar toggle and pick **t3code**.
 3. Recommended: merge `cmux.example.json` into `~/.config/cmux/cmux.json`. It turns on Agent Hibernation, which pauses idle agents and resumes them with `claude --resume` when you open their thread again. It also sets a matching background and names threads after their conversation.
-4. Recommended: install the Claude Code hook. Without it, a thread stays **Working** after you interrupt Claude or `/fork` it, or after a turn dies on an API error, a thread you fork with cmux's Fork Conversation loses **Working** until Claude's next step, a thread whose Claude waits on a monitor or other background task doesn't show **Monitoring** (and can be put to sleep, which ends that task), and a settled thread's Claude comes back without its original flags (see below):
+4. Recommended: install the Claude Code hook. Without it, a thread stays **Working** after you interrupt Claude or `/fork` it, after a turn dies on an API error, after a subagent uses a tool once Claude's turn ended, or when cmux loses the end of a turn, a thread you fork with cmux's Fork Conversation loses **Working** until Claude's next step, a message you send while Claude writes its last reply shows the thread idle until Claude's next step and restarts the **Working** timer, a thread whose Claude waits on a monitor or other background task doesn't show **Monitoring** (and can be put to sleep, which ends that task), and a settled thread's Claude comes back without its original flags (see below):
 
    ```bash
    cp claude-turn-end.sh ~/.config/cmux/ && chmod +x ~/.config/cmux/claude-turn-end.sh

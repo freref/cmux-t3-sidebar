@@ -8,9 +8,13 @@
 # prompt), so the thread stays "working" (or "Input") until your next prompt.
 # Claude Code rewrites its own status file (~/.claude/sessions/<pid>.json) on
 # every busy/idle change: this hook watches it, and when Claude is idle while the
-# turn it saw start never got a Stop, it sends cmux the Stop it missed. A turn
+# turn it saw start never got a Stop, it sends cmux the Stop it missed. When
+# Claude is busy with no turn open (a message you queued starts its own turn
+# after the Stop, with no hook), it tells cmux that turn started. A turn
 # that dies on an API error (StopFailure) ends as "working" for custom sidebars
-# too, so it tells them that one ended. It also takes a pane back for its
+# too, so it tells them that one ended, as it does when a subagent uses a tool
+# while Claude is idle. cmux can also lose its own Stop: the hook sends it
+# again when cmux still has the turn running. It also takes a pane back for its
 # session after a /fork (see reclaim), and puts a session cmux forked back on
 # its own pane (see rebind).
 #
@@ -24,7 +28,7 @@
 # copy (same flags and permission mode) for that.
 #
 # Setup: see README.md (hooks for SessionStart, UserPromptSubmit, PreToolUse,
-# Stop, StopFailure, SessionEnd and FileChanged, each running
+# Stop, StopFailure, SessionEnd, FileChanged and CwdChanged, each running
 # "claude-turn-end.sh <event>").
 
 resume_dir="${XDG_STATE_HOME:-$HOME/.local/state}/cmux-t3/resume"
@@ -118,6 +122,11 @@ rebind() { # rebind <forked session>
   CMUX_CLAUDE_PID=$pid CMUX_SURFACE_ID=$surface CMUX_WORKSPACE_ID=$workspace \
     feed "$event" "$1" "$(field sessions.0.transcript_path "$rec")" "$(field sessions.0.cwd "$rec")" "$surface" "$workspace"
 }
+# Where cmux's hook store has this session's turn: running, idle, needsInput,
+# backgroundWorkPending.
+cmux_lifecycle() {
+  field sessions.0.agent_lifecycle "$(cmux sessions list --agent claude --session "$session" --json)"
+}
 
 # cmux's resume binding for this session as one shell line:
 #   cd -- '<dir>' && env 'K=V' 'claude' '--resume' '<session>' '--permission-mode' 'auto'
@@ -198,8 +207,24 @@ case "$event" in
     { sleep 5; save_resume; find "$resume_dir" -type f -mtime +60 -delete; } >/dev/null 2>&1 &
     printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","watchPaths":["%s"]}}\n' "$status_file"
     ;;
+  CwdChanged)
+    # Claude Code swaps the files FileChanged watches for the ones CwdChanged
+    # hooks return whenever the session's folder changes (any Bash command that
+    # ends in another folder), so after Claude's first cd the status file went
+    # unwatched and an interrupted turn stayed Working.
+    printf '{"hookSpecificOutput":{"hookEventName":"CwdChanged","watchPaths":["%s"]}}\n' "$status_file"
+    ;;
   UserPromptSubmit | PreToolUse)
     reclaim
+    # A subagent's tool call while Claude is idle (one Claude Code runs after a
+    # Stop, or a background agent) isn't a turn and gets no Stop, but cmux's
+    # agent registry takes it as working until the next one. Send the feed one,
+    # once cmux has taken in its own event, unless a turn started meanwhile.
+    if [ "$event" = PreToolUse ] && [[ $input =~ \"agent_id\":\ *\" ]] && [ ! -f "$turn" ] && idle; then
+      { sleep 2; [ ! -f "$turn" ] && idle &&
+        feed Stop "$session" "$(field transcript_path)" "$(field cwd)" "$CMUX_SURFACE_ID" "$CMUX_WORKSPACE_ID"; } >/dev/null 2>&1 &
+      exit 0
+    fi
     # The events that make cmux show "working" open a turn (a tool call opens
     # one for turns Claude starts itself, e.g. after a background task).
     [ -f "$turn" ] || { mkdir -p "${turn%/*}" && printf '%s' "$input" >"$turn"; }
@@ -210,6 +235,13 @@ case "$event" in
     show_background
     # cmux refreshes the binding (e.g. a new permission mode) on every Stop.
     { sleep 2; save_resume; } >/dev/null 2>&1 &
+    # cmux can lose its own Stop: when handing it to the app fails, neither
+    # its hook forwarder nor the CLI it falls back to retries, so the session
+    # shows working until its next turn ends. Once cmux has had time to take
+    # it in, send it again if cmux still has the turn running, unless a new
+    # one started meanwhile.
+    { sleep 3; [ ! -f "$turn" ] && idle && [ "$(cmux_lifecycle)" = running ] &&
+      printf '%s' "$input" | cmux hooks claude stop; } >/dev/null 2>&1 &
     ;;
   SessionEnd)
     rm -f "$turn"
@@ -231,6 +263,17 @@ case "$event" in
     # Background commands that ended without a turn of their own (you stopped
     # them): Claude Code's status drops from "shell" to "idle".
     [ "$(cat "$background_file" 2>/dev/null)" = shell ] && status_is idle && clear_background
+    # A message you queued while Claude worked (or a background task's
+    # notification) starts its own turn right after the Stop, with no
+    # UserPromptSubmit (Claude Code sent that when you queued it), so cmux
+    # shows the session idle until its next tool call. Claude Code writes
+    # "busy" when that turn starts: busy without an open turn means one did.
+    if [ ! -f "$turn" ] && status_is busy; then
+      mkdir -p "${turn%/*}" && printf '%s' "$input" >"$turn"
+      reclaim
+      feed PostToolUse "$session" "$(field transcript_path)" "$(field cwd)" "$CMUX_SURFACE_ID" "$CMUX_WORKSPACE_ID"
+      exit 0
+    fi
     # Claude Code runs Stop hooks before it writes "idle", so an open turn here
     # means Stop never came.
     [ -f "$turn" ] && idle || exit 0

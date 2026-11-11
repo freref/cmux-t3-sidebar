@@ -7,7 +7,7 @@
 
 ## Setup
 
-Requires cmux 0.65.0 or later.
+Requires cmux 0.65.1 or later.
 
 1. Copy `t3code.js` into cmux's sidebars folder:
 
@@ -16,8 +16,8 @@ Requires cmux 0.65.0 or later.
    ```
 
 2. In cmux, right-click the sidebar toggle and pick **t3code**.
-3. Recommended: merge `cmux.example.json` into `~/.config/cmux/cmux.json`. It turns on Agent Hibernation, which pauses idle agents and resumes them with `claude --resume` when you open their thread again. It also sets a matching background and names threads after their conversation.
-4. Recommended: install the Claude Code hook. Without it, a thread stays **Working** after you interrupt Claude or `/fork` it, after a turn dies on an API error, after a subagent uses a tool once Claude's turn ended, or when cmux loses the end of a turn, a thread you fork with cmux's Fork Conversation loses **Working** until Claude's next step, a message you send while Claude writes its last reply shows the thread idle until Claude's next step and restarts the **Working** timer, a thread whose Claude waits on a monitor or other background task doesn't show **Monitoring** (and can be put to sleep, which ends that task), and a settled thread's Claude comes back without its original flags (see below):
+3. Recommended: merge `cmux.example.json` into `~/.config/cmux/cmux.json`. It sets a matching background and names threads after their conversation.
+4. Recommended: install the Claude Code hook. Without it, a thread stays **Working** after you interrupt Claude or `/fork` it, after a turn dies on an API error, after a subagent uses a tool once Claude's turn ended, or when cmux loses the end of a turn, a thread you fork with cmux's Fork Conversation loses **Working** until Claude's next step, a message you send while Claude writes its last reply shows the thread idle until Claude's next step and restarts the **Working** timer, a thread whose Claude waits on a monitor or other background task doesn't show **Monitoring** (and closes when it settles, which ends that task), and a settled thread's Claude comes back without its original flags (see below):
 
    ```bash
    cp claude-turn-end.sh ~/.config/cmux/ && chmod +x ~/.config/cmux/claude-turn-end.sh
@@ -25,6 +25,8 @@ Requires cmux 0.65.0 or later.
 
    Then merge `claude-settings.example.json` into `~/.claude/settings.json` and restart your Claude sessions. A session picks the hook up when it starts or resumes.
 
-Settled threads don't keep Claude running: the sidebar exits every Claude in the thread, and starts each session again in its own tab when you open the thread.
+Settled threads don't stay open. The sidebar closes a settled thread's workspace once its Undo is gone, and keeps the thread's title, folder and agent sessions; opening the thread starts a new workspace and resumes each session, the first in its terminal and the others in splits. So cmux only holds the threads you have open, however many are settled. A thread stays open while it has work going or listens on a port. Whatever else runs in it ends with it, and its terminals come back empty (cmux's History menu reopens the last 100 closed workspaces as they were).
 
-Settings such as the command a new project thread starts with (`NEW_THREAD_COMMAND`, `claude` by default; "No project" threads stay a plain shell), opening a new thread as two panes side by side, both running that command, when the window is at least twice as wide as tall (`SPLIT_NEW_THREAD_RATIO`), auto-settle days, sleeping settled threads, closing settled threads after a number of days (`CLOSE_SETTLED_AFTER_DAYS`, off by default) or beyond a count, oldest first (`MAX_SETTLED_THREADS`, 50 by default: every settled thread keeps a terminal and slows cmux's sidebar down; cmux's History menu reopens the last 100 closed), and light or dark mode are at the top of `t3code.js`.
+cmux gives a sidebar nowhere to save anything, so this one keeps what it knows as `[t3…]` lines at the end of workspace descriptions: one for each open thread, and its favorites and settled threads on two of them.
+
+Settings such as the command a new project thread starts with (`NEW_THREAD_COMMAND`, `claude` by default; "No project" threads stay a plain shell), opening a new thread as two panes side by side, both running that command, when the window is at least twice as wide as tall (`SPLIT_NEW_THREAD_RATIO`), auto-settle days, keeping settled threads open instead (`CLOSE_SETTLED`), how many settled threads are remembered (`MAX_SETTLED_THREADS`, 500 by default), and light or dark mode are at the top of `t3code.js`.

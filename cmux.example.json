@@ -12,14 +12,5 @@
   // Thread titles from the Claude/Codex conversation.
   "automation": {
     "workspaceAutoNaming": true
-  },
-
-  // Past 4 live agents, stop the longest-idle background ones (mostly settled
-  // threads) and resume their session when you open them again.
-  "terminal": {
-    "agentHibernation": {
-      "enabled": true,
-      "maxLiveTerminals": 4
-    }
   }
 }

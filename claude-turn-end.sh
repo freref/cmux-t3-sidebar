@@ -1,6 +1,6 @@
 #!/bin/bash
 # cmux-t3-sidebar: tells cmux that a Claude Code turn ended when Claude Code
-# didn't, and keeps what the sidebar needs to wake a sleeping thread.
+# didn't, and keeps what the sidebar needs to reopen a settled thread.
 #
 # cmux shows a Claude session as working from the prompt (or a tool call) until
 # Claude Code's Stop hook. Claude Code skips Stop when you interrupt the turn
@@ -22,10 +22,10 @@
 # running, but doesn't tell custom sidebars. This hook does, through the
 # workspace's progress label (see show_background).
 #
-# The sidebar puts a settled thread's Claude to sleep (it exits it) and starts
-# it again when you open the thread, with "claude-turn-end.sh resume <session>".
-# cmux drops a session's resume command when Claude exits, so this hook keeps a
-# copy (same flags and permission mode) for that.
+# The sidebar closes a settled thread's workspace and, when you open the thread
+# again, resumes its session in a new one with "claude-turn-end.sh resume
+# <session>". cmux drops a session's resume command when Claude exits, so this
+# hook keeps a copy (same flags and permission mode) for that.
 #
 # Setup: see README.md (hooks for SessionStart, UserPromptSubmit, PreToolUse,
 # Stop, StopFailure, SessionEnd, FileChanged and CwdChanged, each running
@@ -33,10 +33,9 @@
 
 resume_dir="${XDG_STATE_HOME:-$HOME/.local/state}/cmux-t3/resume"
 
-# Run by the sidebar in the thread's terminal. Without a session id it takes
-# the last session this terminal ran (cmux can forget an ended one).
+# Run by the sidebar in a reopened thread's terminal.
 if [ "$1" = resume ]; then
-  id="${2:-$(cat "$resume_dir/surface-$CMUX_SURFACE_ID" 2>/dev/null)}"
+  id="$2"
   saved=$(cat "$resume_dir/$id.sh" 2>/dev/null)
   # Claude Code writes a session's transcript at its first message, so one you
   # never prompted can't be resumed ("No conversation found"). Start it again
@@ -144,8 +143,7 @@ JS
 save_resume() {
   local line
   line=$(osascript -l JavaScript -e "$resume_line_js" "$(cmux surface resume get --json)" "$session" 2>/dev/null)
-  [ -n "$line" ] && mkdir -p "$resume_dir" && printf '%s\n' "$line" >"$resume_dir/$session.sh" &&
-    printf '%s' "$session" >"$resume_dir/surface-$CMUX_SURFACE_ID"
+  [ -n "$line" ] && mkdir -p "$resume_dir" && printf '%s\n' "$line" >"$resume_dir/$session.sh"
 }
 
 # The background tasks a Stop says still run, as two lines: "shell" when all of
@@ -155,7 +153,7 @@ save_resume() {
 # The Monitor tool's tasks are shell tasks to Claude Code's hooks, so argv[1]
 # lists the ones the transcript shows the Monitor tool started.
 # Publishing an artifact arms a "monitor" that waits for its comments, re-armed
-# on every resume: it never ends and sleeping loses nothing, so it doesn't count.
+# on every resume: it never ends and closing loses nothing, so it doesn't count.
 read -r -d '' background_js <<'JS'
 function run(argv) {
   const artifactWatch = (t) => t.type === "monitor" && /^live updates for artifact /.test(t.description || "");
